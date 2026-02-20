@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from .dto import ExperimentLiveInstanceDTO, ExperimentTemplateDTO
 from .factories import loss_factory, optimizer_factory
-from .utils import slice_batch_output, normalize
+from .utils import slice_batch_output
 from .repositories import ExperimentLiveInstanceRepository, ExperimentTemplateRepository
 
 #the optimizer is optimizing a specific tensor
