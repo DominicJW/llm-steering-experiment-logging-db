@@ -149,7 +149,7 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
     def __init__(
         self,
         conn: Optional[sqlite3.Connection] = None,
-        vector_repo: Optional[VectorRepository] = None,
+        vector_repo: VectorRepository = None,
     ):
         super().__init__(conn)
         self.vector_repo = vector_repo or VectorRepository(conn)
@@ -249,7 +249,7 @@ class ExperimentSnapshotRepository(_BaseRepository):
     def __init__(
         self,
         conn: Optional[sqlite3.Connection] = None,
-        vector_repo: Optional[VectorRepository] = None,
+        vector_repo: VectorRepository = None,
     ):
         super().__init__(conn)
         self.vector_repo = vector_repo or VectorRepository(conn)
