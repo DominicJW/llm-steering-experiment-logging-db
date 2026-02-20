@@ -43,10 +43,11 @@ class LiveInstance:
                 f"ExperimentTemplate {live_dto.experiment_template_id} not found"
             )
         #note that 
+        self.vector_data = self.live_dto.vector_data
         with torch.no_grad():
-            self.vector_data.data = et_dto.normalization*F.normalize(self.vector_data,dim=0)
-
+            self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
         self.update_dto_vector()
+        self.vector_data.requires_grad_(True)
 
         # build loss & optimizer from the template
         self.loss_fn = loss_factory(
@@ -64,8 +65,8 @@ class LiveInstance:
 
     def step_optimizer(self):
         with torch.no_grad():
-            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_datas) * self.vector_data / (self.et_dto.normalization**2))
-        self.optimzer.step()
+            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (self.et_dto.normalization**2))
+        self.optimizer.step()
         with torch.no_grad():
             self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
         self.optimizer.zero_grad()
@@ -173,7 +174,7 @@ class BatchSteer:
             )
 
         start = 0
-        tensorstart = start
+        tensor_start = start
         for module,veclist in module_to_veclist.items():
             tensor = torch.concat(veclist, dim=0)  # (num_vecs, width)
             for i, _ in enumerate(veclist):
@@ -182,7 +183,8 @@ class BatchSteer:
                     start, start + self.num_prompts_in_batch
                 )
                 start += self.num_prompts_in_batch
-            tensor_slice = slice(tensorstart,start)
+            tensor_slice = slice(tensor_start,start)
+            tensor_start = start
             self.module_to_hookfn[module] = self._make_hookfn(tensor,tensor_slice)
 
     # ----------------------------------------------------------------------
