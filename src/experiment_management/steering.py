@@ -161,6 +161,8 @@ class BatchSteer:
         self.module_to_hookfn : Dict[str,Callable] = {}
 
     def _make_hookfns(self):#has to be called each time steer is called
+        self.inst_id_to_slice = {}
+        self.module_to_hookfn = {}
         # Group vectors by the submodule they should be injected into
         module_to_instlist = defaultdict(list)
         module_to_veclist = defaultdict(list)
@@ -170,7 +172,7 @@ class BatchSteer:
                 live_obj.vector_data.unsqueeze(0).to(dtype = self.model.dtype,device=self.model.device) #that is a copy 
             )
 
-        start = self.num_prompts_in_batch
+        start = 0
         tensorstart = start
         for module,veclist in module_to_veclist.items():
             tensor = torch.concat(veclist, dim=0)  # (num_vecs, width)
@@ -206,14 +208,18 @@ class BatchSteer:
     # ----------------------------------------------------------------------
     # Loss aggregation
     # ----------------------------------------------------------------------
-    def calc_loss(self, output, input_ids: torch.Tensor) -> torch.Tensor:
+    def calc_loss(self, output, vanilla_output, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.shape[0] != self.num_prompts_in_batch:
+            raise ValueError(
+                f"Expected input_ids batch size {self.num_prompts_in_batch}, got {input_ids.shape[0]}"
+            )
         loss = torch.zeros((1,),dtype=self.model.dtype,device=self.model.device)
-        vanilla_slice = slice(0, self.num_prompts_in_batch)
 
         for live_obj in self.live_objs:
             inst_slice = self.inst_id_to_slice[live_obj.experiment_instance_id]
+            steered_output = slice_batch_output(output, inst_slice)
             inst_loss = live_obj.loss_fn(
-                output, vanilla_slice, inst_slice, input_ids
+                steered_output, vanilla_output, input_ids
             )
             live_obj.last_training_loss = inst_loss
             loss += inst_loss
@@ -237,4 +243,3 @@ class BatchSteer:
                 h.remove()
                 
     
-
