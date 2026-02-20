@@ -10,7 +10,9 @@ def register_loss_fn(name:str, function:Callable):
 def loss_factory(name:str,kwargs:str):
     kwargs = json.loads(kwargs)
     loss_fn = loss_registry[name]
-    return lambda output,vanilla_slice,inst_slice,input_ids : loss_fn(output,vanilla_slice,inst_slice,input_ids,**kwargs)
+    return lambda steered_output,vanilla_output,input_ids : loss_fn(
+        steered_output, vanilla_output, input_ids, **kwargs
+    )
     
     
 optimizer_registry : Dict[str,Type[optim.Optimizer]] = {"AdamW":optim.AdamW}

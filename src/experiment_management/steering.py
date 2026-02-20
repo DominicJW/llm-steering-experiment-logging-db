@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from typing import List, Tuple, Union,Dict,Callable,Type
 
 import torch
+import torch.nn.functional as F
+
 
 from .dto import ExperimentLiveInstanceDTO, ExperimentTemplateDTO
 from .factories import loss_factory, optimizer_factory
@@ -40,7 +42,10 @@ class LiveInstance:
             raise ValueError(
                 f"ExperimentTemplate {live_dto.experiment_template_id} not found"
             )
-        self.vector_data = normalize(live_dto.vector_data,et_dto.normalization)
+        #note that 
+        with torch.no_grad():
+            self.vector_data.data = et_dto.normalization*F.normalize(self.vector_data,dim=0)
+
         self.update_dto_vector()
 
         # build loss & optimizer from the template
@@ -56,6 +61,17 @@ class LiveInstance:
         self.module_name = self.et_dto.module_name
         self.experiment_instance_id = live_dto.experiment_instance_id
         self.last_training_loss = None
+
+    def step_optimizer(self):
+        with torch.no_grad():
+            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_datas) * self.vector_data / (self.et_dto.normalization**2))
+        self.optimzer.step()
+        with torch.no_grad():
+            self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
+        self.optimizer.zero_grad()
+
+
+
 
     # ----------------------------------------------------------------------
     # Simple state mutation
@@ -184,14 +200,14 @@ class BatchSteer:
             return output
 
         return hook
-#incorrect, new hook function must be made each time its steered
+
 
 
     # ----------------------------------------------------------------------
     # Loss aggregation
     # ----------------------------------------------------------------------
     def calc_loss(self, output, input_ids: torch.Tensor) -> torch.Tensor:
-        loss = torch.zeros((1,),dtype=output.hidden_states[0].dtype,device=output.hidden_states[0].device) #not ideal
+        loss = torch.zeros((1,),dtype=self.model.dtype,device=self.model.device)
         vanilla_slice = slice(0, self.num_prompts_in_batch)
 
         for live_obj in self.live_objs:
