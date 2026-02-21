@@ -17,6 +17,10 @@ from .dto import (
 )
 from .utils import tensor_to_bytes, bytes_to_tensor, make_repro_tensor
 
+#possibly refactor such that ids are not passed, apart from to the get methods of respective repos
+#so dtos are passed instead
+
+
 
 class _BaseRepository:
     def __init__(self, conn: Optional[sqlite3.Connection] = None):
@@ -37,6 +41,41 @@ class ExperimentTemplateRepository(_BaseRepository):
     def _create(self, dto: ExperimentTemplateDTO) -> ExperimentTemplateDTO:
         conn = self._conn()
         cur = conn.cursor()
+
+        # Reuse existing template only when all fields match exactly.
+        cur.execute(
+            """
+            SELECT experiment_template_id
+            FROM ExperimentTemplate
+            WHERE prompt_group IS ?
+              AND loss_name IS ?
+              AND loss_additional_parameters IS ?
+              AND optimizer_name IS ?
+              AND optimizer_additional_parameters IS ?
+              AND module_name IS ?
+              AND batch_size IS ?
+              AND normalization IS ?
+            LIMIT 1
+            """,
+            (
+                dto.prompt_group,
+                dto.loss_name,
+                dto.loss_additional_parameters,
+                dto.optimizer_name,
+                dto.optimizer_additional_parameters,
+                dto.module_name,
+                dto.batch_size,
+                dto.normalization,
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            dto.experiment_template_id = (
+                row["experiment_template_id"] if hasattr(row, "keys") else row[0]
+            )
+            self._close(conn)
+            return dto
+
         cur.execute(
             """
             INSERT INTO ExperimentTemplate
@@ -105,9 +144,28 @@ class VectorRepository(_BaseRepository):
     def _create(self, dto: VectorDTO) -> VectorDTO:
         if dto.vector_data is None:
             raise ValueError("vector_data must be provided")
-        vector_bytes = sqlite3.Binary(tensor_to_bytes(dto.vector_data))
         conn = self._conn()
         cur = conn.cursor()
+
+
+        # Reuse existing vector by seed when available.
+        if not (dto.seed is None) :
+            cur.execute(
+                """
+                SELECT vector_id 
+                FROM Vectors
+                WHERE seed IS ?
+                LIMIT 1
+                """,
+                (dto.seed,),
+            )
+            row = cur.fetchone()
+            if row:
+                dto.vector_id = row["vector_id"] if hasattr(row, "keys") else row[0]
+                self._close(conn)
+                return dto
+
+        vector_bytes = sqlite3.Binary(tensor_to_bytes(dto.vector_data))
         cur.execute(
             "INSERT INTO Vectors (vector_data, seed) VALUES (?, ?)",
             (vector_bytes, dto.seed),
@@ -122,13 +180,13 @@ class VectorRepository(_BaseRepository):
         seed: int,
         shape: Union[Tuple[int, ...], torch.Size],
         device: str = "cpu",
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> VectorDTO:
         tensor = make_repro_tensor(shape, seed=seed, device=device, dtype=dtype)
         return self._create(VectorDTO(vector_data=tensor, vector_id=None, seed=seed))
 
-    def create_from_tensor(self, tensor: torch.Tensor, seed: Optional[int] = None) -> VectorDTO:
-        return self._create(VectorDTO(vector_data=tensor, vector_id=None, seed=seed))
+    def create_from_tensor(self, tensor: torch.Tensor) -> VectorDTO:
+        return self._create(VectorDTO(vector_data=tensor, vector_id=None))
 
     def get(self, vector_id: int) -> Optional[VectorDTO]:
         conn = self._conn()
@@ -143,6 +201,11 @@ class VectorRepository(_BaseRepository):
             return None
         tensor = bytes_to_tensor(row["vector_data"])
         return VectorDTO(vector_data=tensor, vector_id=row["vector_id"], seed=row["seed"])
+
+    def create_from_shape(self,shape):
+        seed = random.randint(1,int(1e8))
+        return self.create_from_seed(seed=seed,shape=shape)
+
 
 
 class ExperimentLiveInstanceRepository(_BaseRepository):
@@ -257,6 +320,25 @@ class ExperimentSnapshotRepository(_BaseRepository):
     def _create(self, dto: ExperimentSnapshotDTO) -> ExperimentSnapshotDTO:
         conn = self._conn()
         cur = conn.cursor()
+
+        # Reuse existing snapshot if an identical row already exists.
+        cur.execute(
+            """
+            SELECT snapshot_id
+            FROM ExperimentSnapshot
+            WHERE vector_id IS ?
+              AND iteration_count = ?
+              AND experiment_instance_id = ?
+            LIMIT 1
+            """,
+            (dto.vector_id, dto.iteration_count, dto.experiment_instance_id),
+        )
+        row = cur.fetchone()
+        if row:
+            dto.snapshot_id = row["snapshot_id"] if hasattr(row, "keys") else row[0]
+            self._close(conn)
+            return dto
+
         cur.execute(
             """
             INSERT INTO ExperimentSnapshot
@@ -272,9 +354,7 @@ class ExperimentSnapshotRepository(_BaseRepository):
 
     def create_from_live(self, inst_dto: ExperimentLiveInstanceDTO,save_vector: bool = True) -> ExperimentSnapshotDTO:
         if save_vector:
-            vector_dto = self.vector_repo.create_from_tensor(
-                inst_dto.vector_data, seed=inst_dto.initial_vector_id
-            )
+            vector_dto = self.vector_repo.create_from_tensor(inst_dto.vector_data)
             vector_id = vector_dto.vector_id
         else:
             vector_id = None
@@ -292,6 +372,34 @@ class GeneratedOutputRepository(_BaseRepository):
     def _create(self, dto: GeneratedOutputDTO) -> GeneratedOutputDTO:
         conn = self._conn()
         cur = conn.cursor()
+        vanilla_value = int(bool(dto.vanilla)) if dto.vanilla is not None else None
+
+        # Reuse existing output only when all fields match exactly.
+        cur.execute(
+            """
+            SELECT output_id
+            FROM GeneratedOutput
+            WHERE prompt_id IS ?
+              AND text IS ?
+              AND snapshot_id IS ?
+              AND vanilla IS ?
+              AND generation_details IS ?
+            LIMIT 1
+            """,
+            (
+                dto.prompt_id,
+                dto.text,
+                dto.snapshot_id,
+                vanilla_value,
+                dto.generation_details,
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            dto.output_id = row["output_id"] if hasattr(row, "keys") else row[0]
+            self._close(conn)
+            return dto
+
         cur.execute(
             """
             INSERT INTO GeneratedOutput
@@ -302,7 +410,7 @@ class GeneratedOutputRepository(_BaseRepository):
                 dto.prompt_id,
                 dto.text,
                 dto.snapshot_id,
-                int(bool(dto.vanilla)) if dto.vanilla is not None else None,
+                vanilla_value,
                 dto.generation_details,
             ),
         )
@@ -313,9 +421,9 @@ class GeneratedOutputRepository(_BaseRepository):
 
     def create_from_snapshot(
         self,
-        snap_dto: ExperimentSnapshotDTO,
-        text: str,
-        prompt_id: Optional[int] = None,
+        snap_dto: ExperimentSnapshotDTO = None,
+        text: str = None,
+        prompt_id: int = None,
         vanilla: bool = True,
         generation_details: Optional[str] = None,
     ) -> GeneratedOutputDTO:
@@ -324,7 +432,18 @@ class GeneratedOutputRepository(_BaseRepository):
             prompt_id=prompt_id,
             text=text,
             snapshot_id=snap_dto.snapshot_id,
-            vanilla=vanilla,
+            vanilla=False,
+            generation_details=generation_details,
+        )
+        return self._create(dto)
+
+    def create_vanilla(self,text:str,prompt_id:int,generation_details:Optional[str] = None):
+        dto = GeneratedOutputDTO(
+            output_id=None,
+            prompt_id=prompt_id,
+            text=text,
+            snapshot_id=None,
+            vanilla=True,
             generation_details=generation_details,
         )
         return self._create(dto)
@@ -383,14 +502,29 @@ class MetricRepository(_BaseRepository):
 
 
 class PromptRepository(_BaseRepository):
+    #groups should be created with all prompts at once, not piece meal
+    #user should use create_group_from_strings or create_group_from_dtos
+    #its acceptable for the user to use _create to create a prompt
+
     def _create(self, dto: PromptDTO) -> PromptDTO:
         conn = self._conn()
         cur = conn.cursor()
+
+        # Check if prompt text already exists
+        cur.execute("SELECT prompt_id FROM Prompt WHERE text = ? LIMIT 1", (dto.text,))
+        row = cur.fetchone()
+        if row:
+            dto.prompt_id = row["prompt_id"] if hasattr(row, "keys") else row[0]
+            self._close(conn)
+            return dto
+
+        # Insert only if it doesn't exist
         cur.execute("INSERT INTO Prompt (text) VALUES (?)", (dto.text,))
         dto.prompt_id = cur.lastrowid
         conn.commit()
         self._close(conn)
         return dto
+
 
     def get(self, prompt_id: int) -> Optional[PromptDTO]:
         conn = self._conn()
@@ -404,6 +538,7 @@ class PromptRepository(_BaseRepository):
             return None
         return PromptDTO(text=row["text"], prompt_id=row["prompt_id"])
 
+    #shouldn't be used by user
     def create_group(self) -> PromptGroupDTO:
         conn = self._conn()
         cur = conn.cursor()
@@ -416,13 +551,14 @@ class PromptRepository(_BaseRepository):
     def get_prompts_from_group(self,group_id: int):
         conn = self._conn()
         cur = conn.cursor()
-        cur.execute("SELECT p.text as text FROM Prompt p JOIN GroupPrompts g ON g.prompt_id = p.prompt_id WHERE g.group_id = ?",(group_id,))
-        rows = cur.fetchall()          # list of tuples, e.g. [("text1",), ("text2",)]
-        prompts = [r[0] for r in rows]   # extract strings: ["text1", "text2"]
+        cur.execute("SELECT p.prompt_id, p.text as text FROM Prompt p JOIN GroupPrompts g ON g.prompt_id = p.prompt_id WHERE g.group_id = ?",(group_id,))
+        rows = cur.fetchall()
+        prompts = [PromptDTO(prompt_id= r[0],text=r[1]) for r in rows] 
         cur.close()
         self._close(conn)
         return  prompts
 
+    #shouldn't be used by user
     def add_dto_to_group(self, group_dto: PromptGroupDTO, prompt_dto: PromptDTO) -> None:
         if group_dto.group_id is None or prompt_dto.prompt_id is None:
             raise ValueError("Both group_id and prompt_id must be set")
@@ -435,7 +571,28 @@ class PromptRepository(_BaseRepository):
         conn.commit()
         self._close(conn)
 
-    def create_group_from_dtos(self, prompts: List[PromptDTO]) -> PromptGroupDTO:
+    
+    def create_group_from_dtos(self, prompts: List[PromptDTO]) -> PromptGroupDTO: #assuming persisted dtos
+
+        #prevents duplication
+        conn = self._conn()
+        prompt_ids = sorted(set(prompt.prompt_id for prompt in prompts))
+        placeholders = ",".join("?" for _ in prompt_ids)
+        sql = f"""
+            SELECT gp.group_id
+            FROM GroupPrompts gp
+            WHERE gp.prompt_id IN ({placeholders})
+            GROUP BY gp.group_id
+            HAVING COUNT(DISTINCT gp.prompt_id) = ?
+            LIMIT 1
+            """
+        params = [*prompt_ids, len(prompt_ids)]
+        row = conn.execute(sql, [*prompt_ids, len(prompt_ids)]).fetchone()
+        group_id = row[0] if row else None   # None => no such group exists
+        if group_id:
+            return PromptGroupDTO(group_id)
+        
+
         group = self.create_group()
         for p in prompts:
             self.add_dto_to_group(group, p)
@@ -444,4 +601,3 @@ class PromptRepository(_BaseRepository):
     def create_group_from_strings(self, prompts: List[str]) -> PromptGroupDTO:
         prompt_dtos = [self._create(PromptDTO(text=s)) for s in prompts]
         return self.create_group_from_dtos(prompt_dtos)
-

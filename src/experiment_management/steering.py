@@ -4,10 +4,10 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import List, Tuple, Union,Dict,Callable,Type
+import warnings
 
 import torch
 import torch.nn.functional as F
-
 
 from .dto import ExperimentLiveInstanceDTO, ExperimentTemplateDTO
 from .factories import loss_factory, optimizer_factory
@@ -30,23 +30,28 @@ class LiveInstance:
         live_dto: ExperimentLiveInstanceDTO,
         live_repo: ExperimentLiveInstanceRepository,
         et_repo: ExperimentTemplateRepository,
+        snap_repo: ExperimentSnapshotRepository
     ):
         self.live_dto = live_dto
         self.live_repo = live_repo
         self.et_repo = et_repo
+        self.snap_repo = snap_repo
+        self.last_snapshot = None
+
 
         # expose frequently‑used fields
-
-        self.et_dto = self.et_repo.get(live_dto.experiment_template_id)
+        self.experiment_instance_id = self.live_dto.experiment_instance_id
+        self.experiment_template_id = self.live_dto.experiment_template_id
+        self.et_dto = self.et_repo.get(self.experiment_template_id)
         if self.et_dto is None:
             raise ValueError(
-                f"ExperimentTemplate {live_dto.experiment_template_id} not found"
+                f"ExperimentTemplate {self.live_dto.experiment_template_id} not found"
             )
-        #note that 
-        self.vector_data = self.live_dto.vector_data
+        self.module_name = self.et_dto.module_name
+
         with torch.no_grad():
+            self.live_dto.vector_data = self.live_dto.vector_data.detach().clone()
             self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
-        self.update_dto_vector()
         self.vector_data.requires_grad_(True)
 
         # build loss & optimizer from the template
@@ -56,14 +61,13 @@ class LiveInstance:
         self.optimizer_constructor = optimizer_factory(
             self.et_dto.optimizer_name, self.et_dto.optimizer_additional_parameters
         )
-        
         self.optimizer = self.optimizer_constructor([self.vector_data])
-
-        self.module_name = self.et_dto.module_name
-        self.experiment_instance_id = live_dto.experiment_instance_id
+        self.optimizer.zero_grad()
         self.last_training_loss = None
 
     def step_optimizer(self):
+        if self.vector_data.grad is None:
+            warnings.warn(f"None gradient encountered in LiveInstance.step_optimizer {self.live_dto}")
         with torch.no_grad():
             self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (self.et_dto.normalization**2))
         self.optimizer.step()
@@ -71,80 +75,24 @@ class LiveInstance:
             self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
         self.optimizer.zero_grad()
 
+    @property
+    def vector_data(self):
+        return self.live_dto.vector_data
+    
+    @property
+    def iteration_count(self):
+        return self.live_dto.iteration_count
 
+    @iteration_count.setter
+    def iteration_count(self,value):
+        self.live_dto.iteration_count = value
 
+    def create_snapshot(self,save_vector=False):
+        self.last_snapshot = self.snap_repo.create_from_live(self.live_dto,save_vector=save_vector)
+        return self.last_snapshot
 
-    # ----------------------------------------------------------------------
-    # Simple state mutation
-    # ----------------------------------------------------------------------
-    def add_iteration(self) -> None:
-        """Increment the iteration counter on the underlying DTO."""
-        self.live_dto.iteration_count += 1
-        
-    def update_dto_vector(self) -> None:
-        self.live_dto.vector_data = self.vector_data
-
-    # ----------------------------------------------------------------------
-    # Factory helpers – mirror the repository API
-    # ----------------------------------------------------------------------
-    @classmethod
-    def create_from_template(
-        cls,
-        et_dto: ExperimentTemplateDTO,
-        shape: Union[torch.Size, Tuple[int, ...]],
-        live_repo: ExperimentLiveInstanceRepository,
-        et_repo: ExperimentTemplateRepository,
-    ) -> LiveInstance:
-        """Create a live instance using the repository’s `create_from_template`."""
-        live_dto = live_repo.create_from_template(et_dto, shape)
-        return cls(live_dto, live_repo, et_repo)
-
-    @classmethod
-    def create_from_seed(
-        cls,
-        et_dto: ExperimentTemplateDTO,
-        shape: Union[torch.Size, Tuple[int, ...]],
-        seed: int,
-        live_repo: ExperimentLiveInstanceRepository,
-        et_repo: ExperimentTemplateRepository,
-    ) -> LiveInstance:
-        """Create a live instance from a random seed."""
-        live_dto = live_repo.create_from_seed(et_dto, shape, seed)
-        return cls(live_dto, live_repo, et_repo)
-
-    @classmethod
-    def create_from_tensor(
-        cls,
-        et_dto: ExperimentTemplateDTO,
-        tensor: torch.Tensor,
-        live_repo: ExperimentLiveInstanceRepository,
-        et_repo: ExperimentTemplateRepository,
-    ) -> LiveInstance:
-        """Create a live instance from an already‑prepared tensor."""
-        live_dto = live_repo.create_from_initial_tensor(et_dto, tensor)
-        return cls(live_dto, live_repo, et_repo)
-
-    @classmethod
-    def create_from_initial_vector_id(
-        cls,
-        et_dto: ExperimentTemplateDTO,
-        vector_id: int,
-        live_repo: ExperimentLiveInstanceRepository,
-        et_repo: ExperimentTemplateRepository,
-    ) -> LiveInstance:
-        """
-        Create a live instance when you already have a persisted vector id.
-        The repository does not expose a direct method for this, so we fetch the
-        vector, then build the DTO manually.
-        """
-        # Retrieve the vector DTO (raises if not found)
-        vector_repo = live_repo.vector_repo
-        vec_dto = vector_repo.get(vector_id)
-        if vec_dto is None:
-            raise ValueError(f"Vector {vector_id} does not exist")
-
-        live_dto = live_repo.create_from_vec_dto(experiment_template_dto=et_dto,vec_dto=vec_dto)
-        return cls(live_dto, live_repo, et_repo)
+    def update_repo(self):
+        return self.live_repo.update(self.live_dto)
 
 
 class BatchSteer:
@@ -160,6 +108,8 @@ class BatchSteer:
         self.num_prompts_in_batch = self.live_objs[0].et_dto.batch_size
         self.model = model
         self.module_to_hookfn : Dict[str,Callable] = {}
+        #could enforce that all live_objs have same prompt_group
+
 
     def _make_hookfns(self):#has to be called each time steer is called
         self.inst_id_to_slice = {}
