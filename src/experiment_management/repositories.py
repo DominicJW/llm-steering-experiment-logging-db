@@ -3,6 +3,7 @@ import sqlite3
 import io
 import random
 import torch
+from dataclasses import fields
 
 from .db import get_connection
 from .dto import (
@@ -19,6 +20,86 @@ from .utils import tensor_to_bytes, bytes_to_tensor, make_repro_tensor
 
 #possibly refactor such that ids are not passed, apart from to the get methods of respective repos
 #so dtos are passed instead
+
+
+def _sql_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def convert_dto_into_filter(
+    dto,
+    exclude: Optional[List[str]] = None,
+):
+    dto_field_names = [f.name for f in fields(type(dto))]
+    exclude_set = set(exclude or [])
+    unknown = exclude_set - set(dto_field_names)
+    if unknown:
+        raise ValueError(f"Unknown exclude fields: {sorted(unknown)}")
+
+    filt = {}
+    for field_name in dto_field_names:
+        if field_name in exclude_set:
+            continue
+        filt[field_name] = {"=": getattr(dto, field_name)}
+    return filt
+
+
+def build_predicates_from_filter(dto_type, filt: Optional[dict] = None) -> str:
+    if not filt:
+        return "1=1"
+
+    dto_fields = {f.name for f in fields(dto_type)}
+    allowed_ops = {"=", "!=", "<>", "<", "<=", ">", ">=", "LIKE", "IS", "IS NOT"}
+    predicates = []
+    for field_name, constraints in filt.items():
+        if field_name not in dto_fields:
+            raise ValueError(f"Unknown filter field: {field_name}")
+        if not isinstance(constraints, dict):
+            raise ValueError(
+                f"Constraints for '{field_name}' must be a dict of operator to value"
+            )
+        for op, value in constraints.items():
+            op_upper = str(op).upper()
+            if op_upper not in allowed_ops:
+                raise ValueError(f"Unsupported operator: {op}")
+
+            if value is None and op_upper in {"=", "IS"}:
+                predicates.append(f"{field_name} IS NULL")
+            elif value is None and op_upper in {"!=", "<>", "IS NOT"}:
+                predicates.append(f"{field_name} IS NOT NULL")
+            else:
+                sql_op = "!=" if op_upper == "<>" else op_upper
+                predicates.append(f"{field_name} {sql_op} {_sql_literal(value)}")
+
+    return " AND ".join(predicates) if predicates else "1=1"
+
+
+def build_orderby_from_filter(dto_type, orderby: Optional[dict] = None) -> str:
+    if not orderby:
+        return ""
+    if not isinstance(orderby, dict):
+        raise ValueError("orderby must be a dict of field to 'asc'/'desc'")
+
+    dto_fields = {f.name for f in fields(dto_type)}
+    order_parts = []
+    for field_name, direction in orderby.items():
+        if field_name not in dto_fields:
+            raise ValueError(f"Unknown orderby field: {field_name}")
+        direction_upper = str(direction).upper()
+        if direction_upper not in {"ASC", "DESC"}:
+            raise ValueError(
+                f"Invalid order direction for '{field_name}': {direction}"
+            )
+        order_parts.append(f"{field_name} {direction_upper}")
+
+    return " ORDER BY " + ", ".join(order_parts) if order_parts else ""
 
 
 
@@ -139,6 +220,68 @@ class ExperimentTemplateRepository(_BaseRepository):
     def create_from_args(self, *args, **kwargs) -> ExperimentTemplateDTO:
         return self._create(ExperimentTemplateDTO(*args, **kwargs))
 
+    def find_matching(
+        self,
+        et_dto: ExperimentTemplateDTO,
+        exclude: Optional[List[str]] = None,
+        result_filter: Optional[dict] = None,
+        orderby: Optional[dict] = None,
+    ) -> List[ExperimentTemplateDTO]:
+        template_columns = [f.name for f in fields(ExperimentTemplateDTO)]
+        exclude = list(exclude or [])
+        if "experiment_template_id" not in exclude:
+            exclude.append("experiment_template_id")
+
+        filter_predicates = build_predicates_from_filter(
+            ExperimentTemplateDTO, result_filter
+        )
+        match_filter = convert_dto_into_filter(exclude=exclude, dto=et_dto)
+        match_predicates = build_predicates_from_filter(ExperimentTemplateDTO, match_filter)
+        all_predicates = match_predicates + " AND " + filter_predicates
+
+        # Exclude the input DTO itself from results.
+        if et_dto.experiment_template_id is not None:
+            all_predicates += (
+                f" AND experiment_template_id != {et_dto.experiment_template_id}"
+            )
+        else:
+            self_filter = convert_dto_into_filter(
+                exclude=[],
+                dto=et_dto,
+            )
+            self_predicates = build_predicates_from_filter(
+                ExperimentTemplateDTO, self_filter
+            )
+            all_predicates += f" AND NOT ({self_predicates})"
+
+        order_clause = build_orderby_from_filter(ExperimentTemplateDTO, orderby)
+
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT {", ".join(template_columns)}
+            FROM ExperimentTemplate
+            WHERE {all_predicates}{order_clause}
+            """
+        )
+        rows = cur.fetchall()
+        self._close(conn)
+        return [
+            ExperimentTemplateDTO(
+                prompt_group=row["prompt_group"],
+                loss_name=row["loss_name"],
+                loss_additional_parameters=row["loss_additional_parameters"],
+                optimizer_name=row["optimizer_name"],
+                optimizer_additional_parameters=row["optimizer_additional_parameters"],
+                module_name=row["module_name"],
+                batch_size=row["batch_size"],
+                normalization=row["normalization"],
+                experiment_template_id=row["experiment_template_id"],
+            )
+            for row in rows
+        ]
+
 
 class VectorRepository(_BaseRepository):
     def _create(self, dto: VectorDTO) -> VectorDTO:
@@ -212,7 +355,7 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
     def __init__(
         self,
         conn: Optional[sqlite3.Connection] = None,
-        vector_repo: VectorRepository = None,
+        vector_repo: Optional[VectorRepository] = None,
     ):
         super().__init__(conn)
         self.vector_repo = vector_repo or VectorRepository(conn)
@@ -307,12 +450,63 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
         seed = random.randint(1, int(1e8))
         return self.create_from_seed(experiment_template_dto, shape, seed)
 
+    def get_all_from_experiment_template(
+        self,
+        et_dto: ExperimentTemplateDTO,
+        result_filter: Optional[dict] = None,
+        orderby: Optional[dict] = None,
+    ) -> List[ExperimentLiveInstanceDTO]:
+        template_fields = {f.name for f in fields(ExperimentTemplateDTO)}
+        exclude = [name for name in template_fields if name != "experiment_template_id"]
+
+        match_filter = convert_dto_into_filter(dto=et_dto, exclude=exclude)
+        match_predicates = build_predicates_from_filter(
+            ExperimentLiveInstanceDTO, match_filter
+        )#matches only the id
+
+        filter_predicates = build_predicates_from_filter(
+            ExperimentLiveInstanceDTO, result_filter
+        )
+        all_predicates = match_predicates + " AND " + filter_predicates
+        order_clause = build_orderby_from_filter(ExperimentLiveInstanceDTO, orderby)
+
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT
+                experiment_instance_id,
+                vector_data,
+                initial_vector_id,
+                iteration_count,
+                experiment_template_id
+            FROM ExperimentLiveInstance
+            WHERE {all_predicates}{order_clause}
+            """
+        )
+        rows = cur.fetchall()
+        self._close(conn)
+        return [
+            ExperimentLiveInstanceDTO(
+                experiment_instance_id=row["experiment_instance_id"],
+                vector_data=(
+                    bytes_to_tensor(row["vector_data"])
+                    if row["vector_data"] is not None
+                    else None
+                ),
+                initial_vector_id=row["initial_vector_id"],
+                iteration_count=row["iteration_count"],
+                experiment_template_id=row["experiment_template_id"],
+            )
+            for row in rows
+        ]
+
 
 class ExperimentSnapshotRepository(_BaseRepository):
     def __init__(
         self,
         conn: Optional[sqlite3.Connection] = None,
-        vector_repo: VectorRepository = None,
+        vector_repo: Optional[VectorRepository] = None,
     ):
         super().__init__(conn)
         self.vector_repo = vector_repo or VectorRepository(conn)
@@ -366,6 +560,50 @@ class ExperimentSnapshotRepository(_BaseRepository):
             experiment_instance_id=inst_dto.experiment_instance_id,
         )
         return self._create(snapshot)
+
+    def get_all_from_live(
+        self,
+        live_dto: ExperimentLiveInstanceDTO,
+        result_filter: Optional[dict] = None,
+        orderby: Optional[dict] = None,
+    ) -> List[ExperimentSnapshotDTO]:
+        live_fields = {f.name for f in fields(ExperimentLiveInstanceDTO)}
+        exclude = [name for name in live_fields if name != "experiment_instance_id"]
+
+        match_filter = convert_dto_into_filter(dto=live_dto, exclude=exclude)
+        match_predicates = build_predicates_from_filter(
+            ExperimentSnapshotDTO, match_filter
+        )
+        filter_predicates = build_predicates_from_filter(
+            ExperimentSnapshotDTO, result_filter
+        )
+        all_predicates = match_predicates + " AND " + filter_predicates
+        order_clause = build_orderby_from_filter(ExperimentSnapshotDTO, orderby)
+
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT
+                snapshot_id,
+                vector_id,
+                iteration_count,
+                experiment_instance_id
+            FROM ExperimentSnapshot
+            WHERE {all_predicates}{order_clause}
+            """
+        )
+        rows = cur.fetchall()
+        self._close(conn)
+        return [
+            ExperimentSnapshotDTO(
+                snapshot_id=row["snapshot_id"],
+                vector_id=row["vector_id"],
+                iteration_count=row["iteration_count"],
+                experiment_instance_id=row["experiment_instance_id"],
+            )
+            for row in rows
+        ]
 
 
 class GeneratedOutputRepository(_BaseRepository):
@@ -447,6 +685,54 @@ class GeneratedOutputRepository(_BaseRepository):
             generation_details=generation_details,
         )
         return self._create(dto)
+
+    def get_all_from_snapshot(
+        self,
+        snap_dto: ExperimentSnapshotDTO,
+        result_filter: Optional[dict] = None,
+        orderby: Optional[dict] = None,
+    ) -> List[GeneratedOutputDTO]:
+        snap_fields = {f.name for f in fields(ExperimentSnapshotDTO)}
+        exclude = [name for name in snap_fields if name != "snapshot_id"]
+
+        match_filter = convert_dto_into_filter(dto=snap_dto, exclude=exclude)
+        match_predicates = build_predicates_from_filter(
+            GeneratedOutputDTO, match_filter
+        )
+        filter_predicates = build_predicates_from_filter(
+            GeneratedOutputDTO, result_filter
+        )
+        all_predicates = match_predicates + " AND " + filter_predicates
+        order_clause = build_orderby_from_filter(GeneratedOutputDTO, orderby)
+
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT
+                output_id,
+                prompt_id,
+                text,
+                snapshot_id,
+                vanilla,
+                generation_details
+            FROM GeneratedOutput
+            WHERE {all_predicates}{order_clause}
+            """
+        )
+        rows = cur.fetchall()
+        self._close(conn)
+        return [
+            GeneratedOutputDTO(
+                output_id=row["output_id"],
+                prompt_id=row["prompt_id"],
+                text=row["text"],
+                snapshot_id=row["snapshot_id"],
+                vanilla=(bool(row["vanilla"]) if row["vanilla"] is not None else None),
+                generation_details=row["generation_details"],
+            )
+            for row in rows
+        ]
 
 
 class MetricRepository(_BaseRepository):
@@ -548,7 +834,7 @@ class PromptRepository(_BaseRepository):
         self._close(conn)
         return group
     
-    def get_prompts_from_group(self,group_id: int):
+    def get_prompts_from_group(self,group_id: int):#should be dto but group dto only has id field
         conn = self._conn()
         cur = conn.cursor()
         cur.execute("SELECT p.prompt_id, p.text as text FROM Prompt p JOIN GroupPrompts g ON g.prompt_id = p.prompt_id WHERE g.group_id = ?",(group_id,))
