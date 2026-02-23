@@ -31,7 +31,7 @@ class TensorBlob(TypeDecorator):
         return bytes_to_tensor(value)
 
 
-class PromptDTO(Base):
+class Prompt(Base):
     __tablename__ = "Prompt"
 
     prompt_id: Mapped[Optional[int]] = mapped_column(
@@ -41,19 +41,19 @@ class PromptDTO(Base):
     )
     text: Mapped[str] = mapped_column(Text, nullable=False)
 
-    group_links: Mapped[List[GroupPromptLinkDTO]] = relationship(
-        "GroupPromptLinkDTO",
+    group_links: Mapped[List[PromptGroupItem]] = relationship(
+        "PromptGroupItem",
         back_populates="prompt",
         cascade="all, delete-orphan",
     )
-    generated_outputs: Mapped[List[GeneratedOutputDTO]] = relationship(
-        "GeneratedOutputDTO",
+    generated_outputs: Mapped[List[GeneratedOutput]] = relationship(
+        "GeneratedOutput",
         back_populates="prompt",
     )
-    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="prompt")
+    metrics: Mapped[List[Metric]] = relationship("Metric", back_populates="prompt")
 
 
-class PromptGroupDTO(Base):
+class PromptGroup(Base):
     __tablename__ = "PromptGroup"
 
     group_id: Mapped[Optional[int]] = mapped_column(
@@ -62,19 +62,19 @@ class PromptGroupDTO(Base):
         autoincrement=True,
     )
 
-    group_links: Mapped[List[GroupPromptLinkDTO]] = relationship(
-        "GroupPromptLinkDTO",
+    group_links: Mapped[List[PromptGroupItem]] = relationship(
+        "PromptGroupItem",
         back_populates="group",
         cascade="all, delete-orphan",
     )
-    experiment_templates: Mapped[List[ExperimentTemplateDTO]] = relationship(
-        "ExperimentTemplateDTO",
+    experiment_templates: Mapped[List[ExperimentTemplate]] = relationship(
+        "ExperimentTemplate",
         back_populates="prompt_group_ref",
     )
 
 
-class GroupPromptLinkDTO(Base):
-    __tablename__ = "GroupPrompts"
+class PromptGroupItem(Base):
+    __tablename__ = "PromptGroupItem"
 
     id: Mapped[Optional[int]] = mapped_column(
         Integer,
@@ -84,11 +84,11 @@ class GroupPromptLinkDTO(Base):
     group_id: Mapped[int] = mapped_column(ForeignKey("PromptGroup.group_id"), nullable=False)
     prompt_id: Mapped[int] = mapped_column(ForeignKey("Prompt.prompt_id"), nullable=False)
 
-    group: Mapped[PromptGroupDTO] = relationship("PromptGroupDTO", back_populates="group_links")
-    prompt: Mapped[PromptDTO] = relationship("PromptDTO", back_populates="group_links")
+    group: Mapped[PromptGroup] = relationship("PromptGroup", back_populates="group_links")
+    prompt: Mapped[Prompt] = relationship("Prompt", back_populates="group_links")
 
 
-class ExperimentTemplateDTO(Base):
+class ExperimentTemplate(Base):
     __tablename__ = "ExperimentTemplate"
 
     experiment_template_id: Mapped[Optional[int]] = mapped_column(
@@ -105,18 +105,18 @@ class ExperimentTemplateDTO(Base):
     batch_size: Mapped[Optional[int]] = mapped_column(Integer)
     normalization: Mapped[Optional[float]] = mapped_column(Float)
 
-    prompt_group_ref: Mapped[Optional[PromptGroupDTO]] = relationship(
-        "PromptGroupDTO",
+    prompt_group_ref: Mapped[Optional[PromptGroup]] = relationship(
+        "PromptGroup",
         back_populates="experiment_templates",
     )
-    live_instances: Mapped[List[ExperimentLiveInstanceDTO]] = relationship(
-        "ExperimentLiveInstanceDTO",
+    live_instances: Mapped[List[ExperimentLiveInstance]] = relationship(
+        "ExperimentLiveInstance",
         back_populates="experiment_template",
     )
 
 
-class VectorDTO(Base):
-    __tablename__ = "Vectors"
+class Vector(Base):
+    __tablename__ = "Vector"
 
     vector_id: Mapped[Optional[int]] = mapped_column(
         Integer,
@@ -126,17 +126,17 @@ class VectorDTO(Base):
     vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob)
     seed: Mapped[Optional[int]] = mapped_column(Integer)
 
-    live_instances: Mapped[List[ExperimentLiveInstanceDTO]] = relationship(
-        "ExperimentLiveInstanceDTO",
+    live_instances: Mapped[List[ExperimentLiveInstance]] = relationship(
+        "ExperimentLiveInstance",
         back_populates="initial_vector",
     )
-    snapshots: Mapped[List[ExperimentSnapshotDTO]] = relationship(
-        "ExperimentSnapshotDTO",
+    snapshots: Mapped[List[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
         back_populates="vector",
     )
 
 
-class ExperimentLiveInstanceDTO(Base):
+class ExperimentLiveInstance(Base):
     __tablename__ = "ExperimentLiveInstance"
 
     experiment_instance_id: Mapped[Optional[int]] = mapped_column(
@@ -145,27 +145,27 @@ class ExperimentLiveInstanceDTO(Base):
         autoincrement=True,
     )
     vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob)
-    initial_vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vectors.vector_id"))
+    initial_vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vector.vector_id"))
     iteration_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)
     experiment_template_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("ExperimentTemplate.experiment_template_id")
     )
 
-    initial_vector: Mapped[Optional[VectorDTO]] = relationship(
-        "VectorDTO",
+    initial_vector: Mapped[Optional[Vector]] = relationship(
+        "Vector",
         back_populates="live_instances",
     )
-    experiment_template: Mapped[Optional[ExperimentTemplateDTO]] = relationship(
-        "ExperimentTemplateDTO",
+    experiment_template: Mapped[Optional[ExperimentTemplate]] = relationship(
+        "ExperimentTemplate",
         back_populates="live_instances",
     )
-    snapshots: Mapped[List[ExperimentSnapshotDTO]] = relationship(
-        "ExperimentSnapshotDTO",
+    snapshots: Mapped[List[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
         back_populates="live_instance",
     )
 
 
-class ExperimentSnapshotDTO(Base):
+class ExperimentSnapshot(Base):
     __tablename__ = "ExperimentSnapshot"
 
     snapshot_id: Mapped[Optional[int]] = mapped_column(
@@ -173,25 +173,25 @@ class ExperimentSnapshotDTO(Base):
         primary_key=True,
         autoincrement=True,
     )
-    vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vectors.vector_id"))
+    vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vector.vector_id"))
     iteration_count: Mapped[Optional[int]] = mapped_column(Integer)
     experiment_instance_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("ExperimentLiveInstance.experiment_instance_id")
     )
 
-    vector: Mapped[Optional[VectorDTO]] = relationship("VectorDTO", back_populates="snapshots")
-    live_instance: Mapped[Optional[ExperimentLiveInstanceDTO]] = relationship(
-        "ExperimentLiveInstanceDTO",
+    vector: Mapped[Optional[Vector]] = relationship("Vector", back_populates="snapshots")
+    live_instance: Mapped[Optional[ExperimentLiveInstance]] = relationship(
+        "ExperimentLiveInstance",
         back_populates="snapshots",
     )
-    generated_outputs: Mapped[List[GeneratedOutputDTO]] = relationship(
-        "GeneratedOutputDTO",
+    generated_outputs: Mapped[List[GeneratedOutput]] = relationship(
+        "GeneratedOutput",
         back_populates="snapshot",
     )
-    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="snapshot")
+    metrics: Mapped[List[Metric]] = relationship("Metric", back_populates="snapshot")
 
 
-class GeneratedOutputDTO(Base):
+class GeneratedOutput(Base):
     __tablename__ = "GeneratedOutput"
 
     output_id: Mapped[Optional[int]] = mapped_column(
@@ -205,15 +205,15 @@ class GeneratedOutputDTO(Base):
     vanilla: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
     generation_details: Mapped[Optional[str]] = mapped_column(Text)
 
-    prompt: Mapped[Optional[PromptDTO]] = relationship("PromptDTO", back_populates="generated_outputs")
-    snapshot: Mapped[Optional[ExperimentSnapshotDTO]] = relationship(
-        "ExperimentSnapshotDTO",
+    prompt: Mapped[Optional[Prompt]] = relationship("Prompt", back_populates="generated_outputs")
+    snapshot: Mapped[Optional[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
         back_populates="generated_outputs",
     )
-    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="generated_output")
+    metrics: Mapped[List[Metric]] = relationship("Metric", back_populates="generated_output")
 
 
-class MetricDTO(Base):
+class Metric(Base):
     __tablename__ = "Metric"
 
     metric_id: Mapped[Optional[int]] = mapped_column(
@@ -227,12 +227,12 @@ class MetricDTO(Base):
     prompt_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Prompt.prompt_id"))
     generated_output_id: Mapped[Optional[int]] = mapped_column(ForeignKey("GeneratedOutput.output_id"))
 
-    snapshot: Mapped[Optional[ExperimentSnapshotDTO]] = relationship(
-        "ExperimentSnapshotDTO",
+    snapshot: Mapped[Optional[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
         back_populates="metrics",
     )
-    prompt: Mapped[Optional[PromptDTO]] = relationship("PromptDTO", back_populates="metrics")
-    generated_output: Mapped[Optional[GeneratedOutputDTO]] = relationship(
-        "GeneratedOutputDTO",
+    prompt: Mapped[Optional[Prompt]] = relationship("Prompt", back_populates="metrics")
+    generated_output: Mapped[Optional[GeneratedOutput]] = relationship(
+        "GeneratedOutput",
         back_populates="metrics",
     )

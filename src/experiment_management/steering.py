@@ -9,10 +9,9 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from .dto import ExperimentLiveInstanceDTO, ExperimentTemplateDTO
+from .orm import ExperimentLiveInstance
 from .factories import loss_factory, optimizer_factory
 from .utils import slice_batch_output
-from .repositories import ExperimentLiveInstanceRepository, ExperimentTemplateRepository
 
 #the optimizer is optimizing a specific tensor
 #I am seeing a risk for problems
@@ -27,39 +26,25 @@ class LiveInstance:
 
     def __init__(
         self,
-        live_dto: ExperimentLiveInstanceDTO,
-        live_repo: ExperimentLiveInstanceRepository,
-        et_repo: ExperimentTemplateRepository,
-        snap_repo: ExperimentSnapshotRepository
+        live: ExperimentLiveInstance,
     ):
-        self.live_dto = live_dto
-        self.live_repo = live_repo
-        self.et_repo = et_repo
-        self.snap_repo = snap_repo
+        self.live = live
         self.last_snapshot = None
 
 
-        # expose frequently‑used fields
-        self.experiment_instance_id = self.live_dto.experiment_instance_id
-        self.experiment_template_id = self.live_dto.experiment_template_id
-        self.et_dto = self.et_repo.get(self.experiment_template_id)
-        if self.et_dto is None:
-            raise ValueError(
-                f"ExperimentTemplate {self.live_dto.experiment_template_id} not found"
-            )
-        self.module_name = self.et_dto.module_name
+        self.module_name = self.live.experiment_template.module_name
 
         with torch.no_grad():
-            self.live_dto.vector_data = self.live_dto.vector_data.detach().clone()
-            self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
+            self.live.vector_data = self.live.vector_data.detach().clone()
+            self.vector_data.copy_(self.live.experiment_template.normalization*F.normalize(self.vector_data,dim=0))
         self.vector_data.requires_grad_(True)
 
         # build loss & optimizer from the template
         self.loss_fn = loss_factory(
-            self.et_dto.loss_name, self.et_dto.loss_additional_parameters
+            self.live.experiment_template.loss_name, self.live.experiment_template.loss_additional_parameters
         )
         self.optimizer_constructor = optimizer_factory(
-            self.et_dto.optimizer_name, self.et_dto.optimizer_additional_parameters
+            self.live.experiment_template.optimizer_name, self.live.experiment_template.optimizer_additional_parameters
         )
         self.optimizer = self.optimizer_constructor([self.vector_data])
         self.optimizer.zero_grad()
@@ -67,32 +52,46 @@ class LiveInstance:
 
     def step_optimizer(self):
         if self.vector_data.grad is None:
-            warnings.warn(f"None gradient encountered in LiveInstance.step_optimizer {self.live_dto}")
+            warnings.warn(f"None gradient encountered in LiveInstance.step_optimizer {self.live}")
         with torch.no_grad():
-            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (self.et_dto.normalization**2))
+            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (self.live.experiment_template.normalization**2))
         self.optimizer.step()
         with torch.no_grad():
-            self.vector_data.copy_(self.et_dto.normalization*F.normalize(self.vector_data,dim=0))
+            self.vector_data.copy_(self.live.experiment_template.normalization*F.normalize(self.vector_data,dim=0))
         self.optimizer.zero_grad()
 
     @property
     def vector_data(self):
-        return self.live_dto.vector_data
+        return self.live.vector_data
     
     @property
     def iteration_count(self):
-        return self.live_dto.iteration_count
+        return self.live.iteration_count
 
     @iteration_count.setter
     def iteration_count(self,value):
-        self.live_dto.iteration_count = value
+        self.live.iteration_count = value
 
     def create_snapshot(self,save_vector=False):
-        self.last_snapshot = self.snap_repo.create_from_live(self.live_dto,save_vector=save_vector)
-        return self.last_snapshot
+        if save_vector:    
+            vector = Vector(self.vector_data)
+            with Session(engine):
+                session.add(vector)
+                session.commit()
+                session.refresh(vector)
+        else:
+            vector = None
 
-    def update_repo(self):
-        return self.live_repo.update(self.live_dto)
+        with Session(engine):
+            self.last_snapshot = ExperimentSnapshot(
+                vector=vector,
+                iteration_count=self.iteration_count,
+                live_instance=self.live,
+            )
+            session.add(self.last_snapshot)
+            session.commit()
+            session.refresh(self.last_snapshot)
+        return self.last_snapshot
 
 
 class BatchSteer:
@@ -105,7 +104,7 @@ class BatchSteer:
         self.live_objs = live_objs
         self.inst_id_to_slice: dict[int, slice] = {}
         # All instances are expected to share the same batch size
-        self.num_prompts_in_batch = self.live_objs[0].et_dto.batch_size
+        self.num_prompts_in_batch = self.live_objs[0].live.experiment_template.batch_size
         self.model = model
         self.module_to_hookfn : Dict[str,Callable] = {}
         #could enforce that all live_objs have same prompt_group
