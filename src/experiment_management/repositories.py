@@ -18,27 +18,11 @@ from .dto import (
     PromptDTO,
     PromptGroupDTO,
     VectorDTO,
+    _table_name_for_dto
+
 )
 from .utils import bytes_to_tensor, make_repro_tensor, tensor_to_bytes
 
-
-_DTO_TABLES: Dict[type, str] = {
-    ExperimentTemplateDTO: "ExperimentTemplate",
-    VectorDTO: "Vectors",
-    ExperimentLiveInstanceDTO: "ExperimentLiveInstance",
-    ExperimentSnapshotDTO: "ExperimentSnapshot",
-    GeneratedOutputDTO: "GeneratedOutput",
-    MetricDTO: "Metric",
-    PromptDTO: "Prompt",
-    PromptGroupDTO: "PromptGroup",
-    GroupPromptLinkDTO: "GroupPrompts",
-}
-
-def _table_name_for_dto(dto_type: type) -> str:
-    try:
-        return _DTO_TABLES[dto_type]
-    except KeyError as exc:
-        raise ValueError(f"No table mapping for DTO type: {dto_type}") from exc
 
 
 def _get_persisted_fields(dto_type: type, include_pk: bool = True) -> List[str]:
@@ -253,14 +237,15 @@ class _BaseRepository:
         if not self._external_conn:
             conn.close()
 
-    def get_all(result_filter):
+    def get_all(self, result_filter=None, orderby=None):
         conn = self._conn()
         cur = conn.cursor()
         table_name = _table_name_for_dto(self.DTOClass)
-        
-        filter_predicate ,filter_params = build_predicates_from_filter(self.DTOClass,result_filter)
-        query_params = {}
-        query_params.update(filter_params)
+
+        filter_predicate, query_params = build_predicates_from_filter(
+            self.DTOClass, result_filter
+        )
+        order_sql = build_orderby_from_filter(self.DTOClass, orderby)
 
         select_fields = _get_persisted_fields(self.DTOClass, include_pk=True)
 
@@ -268,22 +253,24 @@ class _BaseRepository:
             table_name,
             select_fields,
             where_sql=filter_predicate,
-            )
+            order_sql=order_sql,
+        )
         cur.execute(select_sql, query_params)
-        conn.commit()
+        rows = cur.fetchall()
         self._close(conn)
-        return dto
+        return [_row_to_dto(self.DTOClass, row) for row in rows]
 
     def _create(self, dto):
         matches = self.existance_check(dto)
-        if len(matches) == 0:
+        if len(matches) == 1:
             print("Match found")
             return matches[0]
         if len(matches) > 1:
             print("Warning: multiple duplicates exist")
             return matches[0]
         print("New Object")
-        
+
+        conn = self._conn()
         cur = conn.cursor()
         table = _table_name_for_dto(self.DTOClass)
         non_pk_fields = _get_persisted_fields(self.DTOClass, include_pk=False)
@@ -291,12 +278,13 @@ class _BaseRepository:
         lookup_params = tuple(row_values[field] for field in non_pk_fields)
         insert_sql = _build_insert_sql(table, non_pk_fields)
         cur.execute(insert_sql, lookup_params)
-        dto.experiment_template_id = cur.lastrowid
+        pk_field = _get_primary_key_field(self.DTOClass)
+        setattr(dto, pk_field, cur.lastrowid)
         conn.commit()
         self._close(conn)
         return dto
 
-    def get(self,id):
+    def get(self, id):
         conn = self._conn()
         cur = conn.cursor()
 
@@ -305,35 +293,38 @@ class _BaseRepository:
         select_fields = _get_persisted_fields(self.DTOClass, include_pk=True)
         sql = _build_select_sql(table, select_fields, where_sql=f"{pk_field} = ?")
 
-        cur.execute(sql, (experiment_template_id,))
+        cur.execute(sql, (id,))
         row = cur.fetchone()
         self._close(conn)
         return _row_to_dto(self.DTOClass, row)
 
-    def existance_check(self):
-        conn = self._conn()
+    def existance_check(self, dto):
         pk_field = _get_primary_key_field(self.DTOClass)
-        filt = convert_dto_into_filter(dto,exculde=[pk_field])
+        filt = convert_dto_into_filter(dto, exclude=[pk_field])
         matches = self.get_all(result_filter=filt)
         return matches
     
     #should bear in mind most repos dont want rows updating
-    def update(self, dto,exclude=[]) -> None:
+    def update(self, dto, exclude=[]) -> None:
         conn = self._conn()
         cur = conn.cursor()
         table = _table_name_for_dto(self.DTOClass)
         pk_field = _get_primary_key_field(self.DTOClass)
-        pk = getattr(dto,pk_field)
+        pk = getattr(dto, pk_field)
         if pk is None:
             raise Exception(f"None PK found in {dto}")
         row = self.get(pk)
         if row is None:
-            raise Exception(f"{pk} not in {_table_name_for_dto(dto)}")
-        set_columns = _get_persisted_fields(self.DTOClass,include_pk=False)
+            raise Exception(f"{pk} not in {_table_name_for_dto(self.DTOClass)}")
+        set_columns = [
+            col
+            for col in _get_persisted_fields(self.DTOClass, include_pk=False)
+            if col not in set(exclude)
+        ]
         update_sql = _build_update_sql(table, set_columns, pk_field)
         row_values = _dto_to_row(dto, include_fields=set_columns)
         params = [row_values[col] for col in set_columns]
-        params.append(dto.experiment_instance_id)
+        params.append(pk)
         cur.execute(update_sql, tuple(params))
         conn.commit()
         self._close(conn)
@@ -349,15 +340,16 @@ class VectorRepository(_BaseRepository):
 
     #over-ridden as vector_data must not be compared, this impacts the _create function as its called there
     def existance_check(self,dto):
-        if dto.vetor_data is None:
+        if dto.vector_data is None:
             raise ValueError("vector_data must be provided")
         pk_field = _get_primary_key_field(self.DTOClass)
         filt = convert_dto_into_filter(dto,exclude = [pk_field,"vector_data"])
+        matches = self.get_all(result_filter=filt)
         if dto.seed is not None:
-            matches = self.get_all(result_filter=filt)
             if matches:
                 dto.vector_id = matches[0].vector_id
                 return [dto]
+        return matches
 
     def create_from_seed(
         self,

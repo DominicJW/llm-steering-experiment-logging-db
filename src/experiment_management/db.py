@@ -12,22 +12,10 @@ from .dto import (
     PromptDTO,
     PromptGroupDTO,
     VectorDTO,
+    _table_name_for_dto,
 )
 
 DB_PATH = "experiments.db"
-
-
-_DTO_TABLES: Dict[type, str] = {
-    ExperimentTemplateDTO: "ExperimentTemplate",
-    VectorDTO: "Vectors",
-    ExperimentLiveInstanceDTO: "ExperimentLiveInstance",
-    ExperimentSnapshotDTO: "ExperimentSnapshot",
-    PromptDTO: "Prompt",
-    PromptGroupDTO: "PromptGroup",
-    GeneratedOutputDTO: "GeneratedOutput",
-    MetricDTO: "Metric",
-    GroupPromptLinkDTO: "GroupPrompts",
-}
 
 _TABLE_REGISTRATION_ORDER: List[type] = [
     ExperimentTemplateDTO,
@@ -40,36 +28,6 @@ _TABLE_REGISTRATION_ORDER: List[type] = [
     MetricDTO,
     GroupPromptLinkDTO,
 ]
-
-#lets put this in the field metadata
-_FOREIGN_KEYS: Dict[str, List[Tuple[str, str, str]]] = {
-    "ExperimentLiveInstance": [
-        ("initial_vector_id", "Vectors", "vector_id"),
-        ("experiment_template_id", "ExperimentTemplate", "experiment_template_id"),
-    ],
-    "ExperimentSnapshot": [
-        ("vector_id", "Vectors", "vector_id"),
-        ("experiment_instance_id", "ExperimentLiveInstance", "experiment_instance_id"),
-    ],
-    "GeneratedOutput": [
-        ("snapshot_id", "ExperimentSnapshot", "snapshot_id"),
-    ],
-    "Metric": [
-        ("snapshot_id", "ExperimentSnapshot", "snapshot_id"),
-        ("generated_output_id", "GeneratedOutput", "output_id"),
-    ],
-    "GroupPrompts": [
-        ("group_id", "PromptGroup", "group_id"),
-        ("prompt_id", "Prompt", "prompt_id"),
-    ],
-}
-
-
-def _table_name_for_dto(dto_type: type) -> str:
-    try:
-        return _DTO_TABLES[dto_type]
-    except KeyError as exc:
-        raise ValueError(f"No table mapping for DTO type: {dto_type}") from exc
 
 
 def _persisted_field_defs(dto_type: type):
@@ -120,8 +78,9 @@ def _create_table(cur: sqlite3.Cursor, dto_type: type) -> None:
     table_name = _table_name_for_dto(dto_type)
     column_sql, _ = _column_sql_and_signature(dto_type)
     fk_sql = [
-        f"FOREIGN KEY({col}) REFERENCES {ref_table}({ref_col})"
-        for col, ref_table, ref_col in _FOREIGN_KEYS.get(table_name, [])
+        f"FOREIGN KEY({f.name}) REFERENCES {_table_name_for_dto(f.metadata['foreign_dto_type'])}({f.metadata['foreign_field']})"
+        for f in fields(dto_type)
+        if f.metadata.get("foreign_key", False)
     ]
     all_defs = column_sql + fk_sql
     create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n    " + ",\n    ".join(all_defs) + "\n);"
