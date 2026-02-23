@@ -1,255 +1,238 @@
-from dataclasses import MISSING, dataclass, field, fields
-from typing import Any, Callable, Dict, List, Optional
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
 import torch
-import sqlite3
-from .utils import tensor_to_bytes, bytes_to_tensor
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import LargeBinary, TypeDecorator
 
-# shared helper used in FK metadata declarations
-def _get_primary_key_field(dto_type: type) -> str:
-    for f in fields(dto_type):
-        if f.metadata.get("persist", True) and f.metadata.get("primary_key", False):
-            return f.name
-    raise ValueError(f"No primary key metadata for DTO type: {dto_type}")
-
-#add foregin key to field
-def db_field(
-    *,
-    sql_type: str,
-    persist: bool = True,
-    primary_key: bool = False,
-    foreign_key: bool = False,
-    foreign_dto_type:Optional = None,
-    foreign_field:Optional[str] = None,
-    autoincrement: bool = False,
-    default: Any = MISSING,
-    encode_callback: Callable = lambda x: x,
-    decode_callback: Callable = lambda x: x
-):
-    metadata = {
-        "sql_type": sql_type,
-        "persist": persist,
-        "primary_key": primary_key,
-        "foreign_key":foreign_key,
-        "foreign_dto_type":foreign_dto_type,
-        "foreign_field":foreign_field,
-        "autoincrement": autoincrement,
-        "encode_callback": encode_callback,
-        "decode_callback": decode_callback
-    }
-    if default is MISSING:
-        return field(metadata=metadata)
-    return field(default=default, metadata=metadata)
+from .utils import bytes_to_tensor, tensor_to_bytes
 
 
-@dataclass
-class PromptDTO:
-    text: str = db_field(sql_type="TEXT")
-    prompt_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+class Base(DeclarativeBase):
+    pass
+
+
+class TensorBlob(TypeDecorator):
+    """Store torch.Tensor values as bytes in SQLite BLOB columns."""
+
+    impl = LargeBinary
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return tensor_to_bytes(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return bytes_to_tensor(value)
+
+
+class PromptDTO(Base):
+    __tablename__ = "Prompt"
+
+    prompt_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
 
-@dataclass
-class PromptGroupDTO:
-    group_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    group_links: Mapped[List[GroupPromptLinkDTO]] = relationship(
+        "GroupPromptLinkDTO",
+        back_populates="prompt",
+        cascade="all, delete-orphan",
+    )
+    generated_outputs: Mapped[List[GeneratedOutputDTO]] = relationship(
+        "GeneratedOutputDTO",
+        back_populates="prompt",
+    )
+    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="prompt")
+
+
+class PromptGroupDTO(Base):
+    __tablename__ = "PromptGroup"
+
+    group_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
+    )
+
+    group_links: Mapped[List[GroupPromptLinkDTO]] = relationship(
+        "GroupPromptLinkDTO",
+        back_populates="group",
+        cascade="all, delete-orphan",
+    )
+    experiment_templates: Mapped[List[ExperimentTemplateDTO]] = relationship(
+        "ExperimentTemplateDTO",
+        back_populates="prompt_group_ref",
     )
 
 
-@dataclass
-class GroupPromptLinkDTO:
-    group_id: int = db_field(
-        sql_type="INTEGER",foreign_key=True,
-        foreign_dto_type=PromptGroupDTO,
-        foreign_field=_get_primary_key_field(PromptGroupDTO)
-        )
-    prompt_id: int = db_field(
-        sql_type="INTEGER",
-        foreign_dto_type=PromptDTO,
-        foreign_field=_get_primary_key_field(PromptDTO)
-        )
-    id: Optional[int] = db_field(
-        sql_type="INTEGER",
+class GroupPromptLinkDTO(Base):
+    __tablename__ = "GroupPrompts"
+
+    id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
+    group_id: Mapped[int] = mapped_column(ForeignKey("PromptGroup.group_id"), nullable=False)
+    prompt_id: Mapped[int] = mapped_column(ForeignKey("Prompt.prompt_id"), nullable=False)
 
-#should have sane defaults
-@dataclass
-class ExperimentTemplateDTO:
-    prompt_group: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=PromptGroupDTO,
-        foreign_field=_get_primary_key_field(PromptGroupDTO))
-    loss_name: Optional[str] = db_field(sql_type="TEXT", default=None)
-    loss_additional_parameters: Optional[str] = db_field(sql_type="TEXT", default=None)
-    optimizer_name: Optional[str] = db_field(sql_type="TEXT", default=None) 
-    optimizer_additional_parameters: Optional[str] = db_field(sql_type="TEXT", default=None) 
-    module_name: Optional[str] = db_field(sql_type="TEXT", default=None) 
-    batch_size: Optional[int] = db_field(sql_type="INTEGER", default=None) 
-    normalization: Optional[float] = db_field(sql_type="REAL", default=None) 
-    experiment_template_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    group: Mapped[PromptGroupDTO] = relationship("PromptGroupDTO", back_populates="group_links")
+    prompt: Mapped[PromptDTO] = relationship("PromptDTO", back_populates="group_links")
+
+
+class ExperimentTemplateDTO(Base):
+    __tablename__ = "ExperimentTemplate"
+
+    experiment_template_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
+    )
+    prompt_group: Mapped[Optional[int]] = mapped_column(ForeignKey("PromptGroup.group_id"))
+    loss_name: Mapped[Optional[str]] = mapped_column(Text)
+    loss_additional_parameters: Mapped[Optional[str]] = mapped_column(Text)
+    optimizer_name: Mapped[Optional[str]] = mapped_column(Text)
+    optimizer_additional_parameters: Mapped[Optional[str]] = mapped_column(Text)
+    module_name: Mapped[Optional[str]] = mapped_column(Text)
+    batch_size: Mapped[Optional[int]] = mapped_column(Integer)
+    normalization: Mapped[Optional[float]] = mapped_column(Float)
+
+    prompt_group_ref: Mapped[Optional[PromptGroupDTO]] = relationship(
+        "PromptGroupDTO",
+        back_populates="experiment_templates",
+    )
+    live_instances: Mapped[List[ExperimentLiveInstanceDTO]] = relationship(
+        "ExperimentLiveInstanceDTO",
+        back_populates="experiment_template",
     )
 
-@dataclass
-class VectorDTO:
-    vector_data: Optional[torch.Tensor] = db_field(
-        sql_type="BLOB",
-        encode_callback=lambda value: sqlite3.Binary(tensor_to_bytes(value)),
-        decode_callback=lambda value: bytes_to_tensor(value),
-        default=None
-        ) #shouldn't be optional
-    vector_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+
+class VectorDTO(Base):
+    __tablename__ = "Vectors"
+
+    vector_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
-    seed: Optional[int] = db_field(sql_type="INTEGER", default=None)
+    vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob)
+    seed: Mapped[Optional[int]] = mapped_column(Integer)
 
-@dataclass
-class ExperimentLiveInstanceDTO:
-    experiment_instance_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    live_instances: Mapped[List[ExperimentLiveInstanceDTO]] = relationship(
+        "ExperimentLiveInstanceDTO",
+        back_populates="initial_vector",
+    )
+    snapshots: Mapped[List[ExperimentSnapshotDTO]] = relationship(
+        "ExperimentSnapshotDTO",
+        back_populates="vector",
+    )
+
+
+class ExperimentLiveInstanceDTO(Base):
+    __tablename__ = "ExperimentLiveInstance"
+
+    experiment_instance_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
-    vector_data: Optional[torch.Tensor] = db_field(
-        sql_type="BLOB",
-        encode_callback=lambda value: sqlite3.Binary(tensor_to_bytes(value)),
-        decode_callback=lambda value: bytes_to_tensor(value),
-        default=None,
+    vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob)
+    initial_vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vectors.vector_id"))
+    iteration_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    experiment_template_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ExperimentTemplate.experiment_template_id")
     )
-    initial_vector_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=VectorDTO,
-        foreign_field=_get_primary_key_field(VectorDTO)) #shouldn't be optional
-    iteration_count: Optional[int] = db_field(sql_type="INTEGER", default=0)
-    experiment_template_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-         default=None,
-        foreign_key=True,
-        foreign_dto_type=ExperimentTemplateDTO,
-        foreign_field=_get_primary_key_field(ExperimentTemplateDTO))#shouldn't be optional
 
-@dataclass
-class ExperimentSnapshotDTO:
-    snapshot_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    initial_vector: Mapped[Optional[VectorDTO]] = relationship(
+        "VectorDTO",
+        back_populates="live_instances",
+    )
+    experiment_template: Mapped[Optional[ExperimentTemplateDTO]] = relationship(
+        "ExperimentTemplateDTO",
+        back_populates="live_instances",
+    )
+    snapshots: Mapped[List[ExperimentSnapshotDTO]] = relationship(
+        "ExperimentSnapshotDTO",
+        back_populates="live_instance",
+    )
+
+
+class ExperimentSnapshotDTO(Base):
+    __tablename__ = "ExperimentSnapshot"
+
+    snapshot_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
-    vector_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=VectorDTO,
-        foreign_field=_get_primary_key_field(VectorDTO)) 
-    iteration_count: Optional[int] = db_field(sql_type="INTEGER", default=None) #shouldn't be optional
-    experiment_instance_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=ExperimentLiveInstanceDTO,
-        foreign_field=_get_primary_key_field(ExperimentLiveInstanceDTO)) #shouldn't be optional
+    vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vectors.vector_id"))
+    iteration_count: Mapped[Optional[int]] = mapped_column(Integer)
+    experiment_instance_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ExperimentLiveInstance.experiment_instance_id")
+    )
 
-@dataclass
-class GeneratedOutputDTO:
-    output_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    vector: Mapped[Optional[VectorDTO]] = relationship("VectorDTO", back_populates="snapshots")
+    live_instance: Mapped[Optional[ExperimentLiveInstanceDTO]] = relationship(
+        "ExperimentLiveInstanceDTO",
+        back_populates="snapshots",
+    )
+    generated_outputs: Mapped[List[GeneratedOutputDTO]] = relationship(
+        "GeneratedOutputDTO",
+        back_populates="snapshot",
+    )
+    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="snapshot")
+
+
+class GeneratedOutputDTO(Base):
+    __tablename__ = "GeneratedOutput"
+
+    output_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
-    prompt_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        foreign_dto_type=PromptDTO,
-        foreign_field=_get_primary_key_field(PromptDTO)
-        )
-    text: Optional[str] = db_field(sql_type="TEXT", default=None)
-    snapshot_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=ExperimentSnapshotDTO,
-        foreign_field=_get_primary_key_field(ExperimentSnapshotDTO)) 
-    vanilla: Optional[bool] = db_field(
-        sql_type="INTEGER",
-        encode_callback=lambda value: int(bool(value)),
-        decode_callback=lambda value: bool(value),
-        default=True,
-    )
-    generation_details: Optional[str] = db_field(sql_type="TEXT", default=None)
+    prompt_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Prompt.prompt_id"))
+    text: Mapped[Optional[str]] = mapped_column(Text)
+    snapshot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ExperimentSnapshot.snapshot_id"))
+    vanilla: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
+    generation_details: Mapped[Optional[str]] = mapped_column(Text)
 
-@dataclass
-class MetricDTO:
-    value: float = db_field(sql_type="REAL")
-    description: Optional[str] = db_field(sql_type="TEXT")
-    metric_id: Optional[int] = db_field(
-        sql_type="INTEGER",
+    prompt: Mapped[Optional[PromptDTO]] = relationship("PromptDTO", back_populates="generated_outputs")
+    snapshot: Mapped[Optional[ExperimentSnapshotDTO]] = relationship(
+        "ExperimentSnapshotDTO",
+        back_populates="generated_outputs",
+    )
+    metrics: Mapped[List[MetricDTO]] = relationship("MetricDTO", back_populates="generated_output")
+
+
+class MetricDTO(Base):
+    __tablename__ = "Metric"
+
+    metric_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
         primary_key=True,
         autoincrement=True,
-        default=None,
     )
-    snapshot_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        default=None,
-        foreign_key=True,
-        foreign_dto_type=ExperimentSnapshotDTO,
-        foreign_field=_get_primary_key_field(ExperimentSnapshotDTO)) 
-    prompt_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        foreign_dto_type=PromptDTO,
-        foreign_field=_get_primary_key_field(PromptDTO))
-    generated_output_id: Optional[int] = db_field(
-        sql_type="INTEGER",
-        foreign_dto_type=GeneratedOutputDTO,
-        foreign_field=_get_primary_key_field(GeneratedOutputDTO))
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    snapshot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ExperimentSnapshot.snapshot_id"))
+    prompt_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Prompt.prompt_id"))
+    generated_output_id: Mapped[Optional[int]] = mapped_column(ForeignKey("GeneratedOutput.output_id"))
 
-
-_DTO_TABLES: Dict[type, str] = {
-    ExperimentTemplateDTO: "ExperimentTemplate",
-    VectorDTO: "Vectors",
-    ExperimentLiveInstanceDTO: "ExperimentLiveInstance",
-    ExperimentSnapshotDTO: "ExperimentSnapshot",
-    PromptDTO: "Prompt",
-    PromptGroupDTO: "PromptGroup",
-    GeneratedOutputDTO: "GeneratedOutput",
-    MetricDTO: "Metric",
-    GroupPromptLinkDTO: "GroupPrompts",
-}
-
-_TABLE_REGISTRATION_ORDER: List[type] = [
-    ExperimentTemplateDTO,
-    VectorDTO,
-    ExperimentLiveInstanceDTO,
-    ExperimentSnapshotDTO,
-    PromptDTO,
-    PromptGroupDTO,
-    GeneratedOutputDTO,
-    MetricDTO,
-    GroupPromptLinkDTO,
-]
-
-
-def _table_name_for_dto(dto_type: type) -> str:
-    try:
-        return _DTO_TABLES[dto_type]
-    except KeyError as exc:
-        raise ValueError(f"No table mapping for DTO type: {dto_type}") from exc
+    snapshot: Mapped[Optional[ExperimentSnapshotDTO]] = relationship(
+        "ExperimentSnapshotDTO",
+        back_populates="metrics",
+    )
+    prompt: Mapped[Optional[PromptDTO]] = relationship("PromptDTO", back_populates="metrics")
+    generated_output: Mapped[Optional[GeneratedOutputDTO]] = relationship(
+        "GeneratedOutputDTO",
+        back_populates="metrics",
+    )

@@ -1,13 +1,13 @@
-from dataclasses import fields
-from typing import Dict, List, Optional, Tuple, Union
+from __future__ import annotations
 
 import random
-import sqlite3
-from uuid import uuid4
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from sqlalchemy import and_, distinct, func, select
+from sqlalchemy.orm import Session
 
-from .db import get_connection
+from .db import get_session
 from .dto import (
     ExperimentLiveInstanceDTO,
     ExperimentSnapshotDTO,
@@ -18,30 +18,21 @@ from .dto import (
     PromptDTO,
     PromptGroupDTO,
     VectorDTO,
-    _table_name_for_dto
-
 )
-from .utils import bytes_to_tensor, make_repro_tensor, tensor_to_bytes
-
+from .utils import make_repro_tensor
 
 
 def _get_persisted_fields(dto_type: type, include_pk: bool = True) -> List[str]:
-    result = []
-    for f in fields(dto_type):
-        if not f.metadata.get("persist", True):
-            continue
-        if not include_pk and f.metadata.get("primary_key", False):
-            continue
-        result.append(f.name)
-    return result
+    mapper = dto_type.__mapper__
+    pk_names = {col.key for col in mapper.primary_key}
+    fields = [prop.key for prop in mapper.column_attrs]
+    if include_pk:
+        return fields
+    return [name for name in fields if name not in pk_names]
 
 
 def _get_primary_key_field(dto_type: type) -> str:
-    pk_fields = [
-        f.name
-        for f in fields(dto_type)
-        if f.metadata.get("persist", True) and f.metadata.get("primary_key", False)
-    ]
+    pk_fields = [col.key for col in dto_type.__mapper__.primary_key]
     if not pk_fields:
         raise ValueError(f"No primary key metadata for DTO type: {dto_type}")
     if len(pk_fields) > 1:
@@ -49,104 +40,11 @@ def _get_primary_key_field(dto_type: type) -> str:
     return pk_fields[0]
 
 
-def _get_field_def(dto_type: type, field_name: str):
-    for field_def in fields(dto_type):
-        if field_def.name == field_name:
-            return field_def
-    raise ValueError(f"Unknown field '{field_name}' for DTO type: {dto_type.__name__}")
-
-
-def _encode_field_value(dto_type: type, field_name: str, value):
-    field_def = _get_field_def(dto_type, field_name)
-    encoder = field_def.metadata.get("encode_callback", lambda x: x)
-    if value is None:
-        return None
-    return encoder(value)
-
-
-def _decode_field_value(dto_type: type, field_name: str, value):
-    field_def = _get_field_def(dto_type, field_name)
-    decoder = field_def.metadata.get("decode_callback", lambda x: x)
-    if value is None:
-        return None
-    return decoder(value)
-
-
-def _dto_to_row(
-    dto,
-    include_fields: Optional[List[str]] = None,
-    exclude_fields: Optional[List[str]] = None,
-) -> Dict[str, object]:
-    dto_type = type(dto)
-    persisted_fields = set(_get_persisted_fields(dto_type, include_pk=True))
-
-    if include_fields is None:
-        include_fields = _get_persisted_fields(dto_type, include_pk=True)
-    unknown_includes = set(include_fields) - persisted_fields
-    if unknown_includes:
-        raise ValueError(f"Unknown include fields: {sorted(unknown_includes)}")
-
-    exclude_set = set(exclude_fields or [])
-    unknown_excludes = exclude_set - persisted_fields
-    if unknown_excludes:
-        raise ValueError(f"Unknown exclude fields: {sorted(unknown_excludes)}")
-
-    row = {}
-    for name in include_fields:
-        if name in exclude_set:
-            continue
-        row[name] = _encode_field_value(dto_type, name, getattr(dto, name))
-    return row
-
-
-def _row_to_dto(dto_type: type, row):
-    if row is None:
-        return None
-
-    if hasattr(row, "keys"):
-        row_data = {k: row[k] for k in row.keys()}
-    else:
-        row_data = dict(row)
-
-    kwargs = {}
-    for f in fields(dto_type):
-        if f.name in row_data:
-            kwargs[f.name] = _decode_field_value(dto_type, f.name, row_data[f.name])
-    return dto_type(**kwargs)
-
-
-def _build_insert_sql(table: str, columns: List[str]) -> str:
-    if not columns:
-        return f"INSERT INTO {table} DEFAULT VALUES"
-    placeholders = ", ".join("?" for _ in columns)
-    col_sql = ", ".join(columns)
-    return f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
-
-
-def _build_select_sql(
-    table: str,
-    columns: List[str],
-    where_sql: str = "",
-    order_sql: str = "",
-) -> str:
-    select_cols = ", ".join(columns) if columns else "*"
-    sql = f"SELECT {select_cols} FROM {table}"
-    if where_sql:
-        sql += f" WHERE {where_sql}"
-    if order_sql:
-        sql += order_sql
-    return sql
-
-
-def _build_update_sql(table: str, set_columns: List[str], pk_column: str) -> str:
-    set_clause = ", ".join(f"{col} = ?" for col in set_columns)
-    return f"UPDATE {table} SET {set_clause} WHERE {pk_column} = ?"
-
-
-def _build_exact_match_where(columns: List[str]) -> str:
-    if not columns:
-        return "1=1"
-    return " AND ".join(f"{col} IS ?" for col in columns)
+def _get_model_column(dto_type: type, field_name: str):
+    dto_fields = set(_get_persisted_fields(dto_type, include_pk=True))
+    if field_name not in dto_fields:
+        raise ValueError(f"Unknown filter/orderby field: {field_name}")
+    return getattr(dto_type, field_name)
 
 
 def convert_dto_into_filter(
@@ -169,15 +67,12 @@ def convert_dto_into_filter(
 
 def build_predicates_from_filter(dto_type, filt: Optional[dict] = None):
     if not filt:
-        return ("1=1", {})
+        return []
 
-    dto_fields = set(_get_persisted_fields(dto_type, include_pk=True))
     allowed_ops = {"=", "!=", "<>", "<", "<=", ">", ">=", "LIKE", "IS", "IS NOT"}
     predicates = []
-    query_params = {}
     for field_name, constraints in filt.items():
-        if field_name not in dto_fields:
-            raise ValueError(f"Unknown filter field: {field_name}")
+        column = _get_model_column(dto_type, field_name)
         if not isinstance(constraints, dict):
             raise ValueError(
                 f"Constraints for '{field_name}' must be a dict of operator to value"
@@ -186,79 +81,84 @@ def build_predicates_from_filter(dto_type, filt: Optional[dict] = None):
             op_upper = str(op).upper()
             if op_upper not in allowed_ops:
                 raise ValueError(f"Unsupported operator: {op}")
-            encoded_value = _encode_field_value(dto_type, field_name, value)
-            if encoded_value is None and op_upper in {"=", "IS"}:
-                predicates.append(f"{field_name} IS NULL")
-            elif encoded_value is None and op_upper in {"!=", "<>", "IS NOT"}:
-                predicates.append(f"{field_name} IS NOT NULL")
-            else:
-                sql_op = "!=" if op_upper == "<>" else op_upper
 
-                param_name = f"filter_{uuid4().hex}"
-                query_params[param_name] = encoded_value
-                predicates.append(f"{field_name} {sql_op} :{param_name}")
+            if op_upper in {"=", "IS"} and value is None:
+                predicates.append(column.is_(None))
+            elif op_upper in {"!=", "<>", "IS NOT"} and value is None:
+                predicates.append(column.is_not(None))
+            elif op_upper == "=":
+                predicates.append(column == value)
+            elif op_upper in {"!=", "<>"}:
+                predicates.append(column != value)
+            elif op_upper == "<":
+                predicates.append(column < value)
+            elif op_upper == "<=":
+                predicates.append(column <= value)
+            elif op_upper == ">":
+                predicates.append(column > value)
+            elif op_upper == ">=":
+                predicates.append(column >= value)
+            elif op_upper == "LIKE":
+                predicates.append(column.like(value))
+            elif op_upper == "IS":
+                predicates.append(column.is_(value))
+            elif op_upper == "IS NOT":
+                predicates.append(column.is_not(value))
 
-    predicate_sql = " AND ".join(predicates) if predicates else "1=1"
-    return (predicate_sql, query_params)
+    return predicates
 
 
-def build_orderby_from_filter(dto_type, orderby: Optional[dict] = None) -> str:
+def build_orderby_from_filter(dto_type, orderby: Optional[dict] = None):
     if not orderby:
-        return ""
+        return []
     if not isinstance(orderby, dict):
         raise ValueError("orderby must be a dict of field to 'asc'/'desc'")
 
-    dto_fields = set(_get_persisted_fields(dto_type, include_pk=True))
     order_parts = []
     for field_name, direction in orderby.items():
-        if field_name not in dto_fields:
-            raise ValueError(f"Unknown orderby field: {field_name}")
+        column = _get_model_column(dto_type, field_name)
         direction_upper = str(direction).upper()
-        if direction_upper not in {"ASC", "DESC"}:
+        if direction_upper == "ASC":
+            order_parts.append(column.asc())
+        elif direction_upper == "DESC":
+            order_parts.append(column.desc())
+        else:
             raise ValueError(
                 f"Invalid order direction for '{field_name}': {direction}"
             )
-        order_parts.append(f"{field_name} {direction_upper}")
 
-    return " ORDER BY " + ", ".join(order_parts) if order_parts else ""
+    return order_parts
 
 
 class _BaseRepository:
-    def __init__(self, conn: Optional[sqlite3.Connection] = None):
-        self._external_conn = conn
+    DTOClass = None
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = self._external_conn or get_connection()
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-        return conn
+    def __init__(self, conn: Optional[Session] = None):
+        self._external_session = conn
 
-    def _close(self, conn: sqlite3.Connection) -> None:
-        if not self._external_conn:
-            conn.close()
+    def _open_session(self) -> Tuple[Session, bool]:
+        if self._external_session is not None:
+            return self._external_session, False
+        return get_session(), True
+
+    @staticmethod
+    def _close_session(session: Session, should_close: bool) -> None:
+        if should_close:
+            session.close()
 
     def get_all(self, result_filter=None, orderby=None):
-        conn = self._conn()
-        cur = conn.cursor()
-        table_name = _table_name_for_dto(self.DTOClass)
-
-        filter_predicate, query_params = build_predicates_from_filter(
-            self.DTOClass, result_filter
-        )
-        order_sql = build_orderby_from_filter(self.DTOClass, orderby)
-
-        select_fields = _get_persisted_fields(self.DTOClass, include_pk=True)
-
-        select_sql = _build_select_sql(
-            table_name,
-            select_fields,
-            where_sql=filter_predicate,
-            order_sql=order_sql,
-        )
-        cur.execute(select_sql, query_params)
-        rows = cur.fetchall()
-        self._close(conn)
-        return [_row_to_dto(self.DTOClass, row) for row in rows]
+        session, should_close = self._open_session()
+        try:
+            stmt = select(self.DTOClass)
+            predicates = build_predicates_from_filter(self.DTOClass, result_filter)
+            if predicates:
+                stmt = stmt.where(and_(*predicates))
+            order_clauses = build_orderby_from_filter(self.DTOClass, orderby)
+            if order_clauses:
+                stmt = stmt.order_by(*order_clauses)
+            return list(session.scalars(stmt).all())
+        finally:
+            self._close_session(session, should_close)
 
     def _create(self, dto):
         matches = self.existance_check(dto)
@@ -270,85 +170,95 @@ class _BaseRepository:
             return matches[0]
         print("New Object")
 
-        conn = self._conn()
-        cur = conn.cursor()
-        table = _table_name_for_dto(self.DTOClass)
-        non_pk_fields = _get_persisted_fields(self.DTOClass, include_pk=False)
-        row_values = _dto_to_row(dto, include_fields=non_pk_fields)
-        lookup_params = tuple(row_values[field] for field in non_pk_fields)
-        insert_sql = _build_insert_sql(table, non_pk_fields)
-        cur.execute(insert_sql, lookup_params)
-        pk_field = _get_primary_key_field(self.DTOClass)
-        setattr(dto, pk_field, cur.lastrowid)
-        conn.commit()
-        self._close(conn)
-        return dto
+        session, should_close = self._open_session()
+        try:
+            session.add(dto)
+            session.commit()
+            session.refresh(dto)
+            return dto
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self._close_session(session, should_close)
 
     def get(self, id):
-        conn = self._conn()
-        cur = conn.cursor()
-
-        table = _table_name_for_dto(self.DTOClass)
-        pk_field = _get_primary_key_field(self.DTOClass)
-        select_fields = _get_persisted_fields(self.DTOClass, include_pk=True)
-        sql = _build_select_sql(table, select_fields, where_sql=f"{pk_field} = ?")
-
-        cur.execute(sql, (id,))
-        row = cur.fetchone()
-        self._close(conn)
-        return _row_to_dto(self.DTOClass, row)
+        session, should_close = self._open_session()
+        try:
+            return session.get(self.DTOClass, id)
+        finally:
+            self._close_session(session, should_close)
 
     def existance_check(self, dto):
         pk_field = _get_primary_key_field(self.DTOClass)
         filt = convert_dto_into_filter(dto, exclude=[pk_field])
         matches = self.get_all(result_filter=filt)
         return matches
-    
-    #should bear in mind most repos dont want rows updating
-    def update(self, dto, exclude=[]) -> None:
-        conn = self._conn()
-        cur = conn.cursor()
-        table = _table_name_for_dto(self.DTOClass)
-        pk_field = _get_primary_key_field(self.DTOClass)
-        pk = getattr(dto, pk_field)
-        if pk is None:
-            raise Exception(f"None PK found in {dto}")
-        row = self.get(pk)
-        if row is None:
-            raise Exception(f"{pk} not in {_table_name_for_dto(self.DTOClass)}")
-        set_columns = [
-            col
-            for col in _get_persisted_fields(self.DTOClass, include_pk=False)
-            if col not in set(exclude)
-        ]
-        update_sql = _build_update_sql(table, set_columns, pk_field)
-        row_values = _dto_to_row(dto, include_fields=set_columns)
-        params = [row_values[col] for col in set_columns]
-        params.append(pk)
-        cur.execute(update_sql, tuple(params))
-        conn.commit()
-        self._close(conn)
-            
+
+    # should bear in mind most repos dont want rows updating
+    def update(self, dto, exclude=None) -> None:
+        exclude_set = set(exclude or [])
+        session, should_close = self._open_session()
+        try:
+            pk_field = _get_primary_key_field(self.DTOClass)
+            pk = getattr(dto, pk_field)
+            if pk is None:
+                raise Exception(f"None PK found in {dto}")
+
+            persisted = session.get(self.DTOClass, pk)
+            if persisted is None:
+                raise Exception(f"{pk} not in {self.DTOClass.__tablename__}")
+
+            set_columns = [
+                col
+                for col in _get_persisted_fields(self.DTOClass, include_pk=False)
+                if col not in exclude_set
+            ]
+            for col in set_columns:
+                setattr(persisted, col, getattr(dto, col))
+
+            session.commit()
+
+            # Keep caller's object synchronized with persisted state
+            for col in _get_persisted_fields(self.DTOClass, include_pk=True):
+                setattr(dto, col, getattr(persisted, col))
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self._close_session(session, should_close)
+
+
 class ExperimentTemplateRepository(_BaseRepository):
     DTOClass = ExperimentTemplateDTO
+
     def create_from_args(self, *args, **kwargs) -> ExperimentTemplateDTO:
-        return self._create(ExperimentTemplateDTO(*args, **kwargs))
+        if args:
+            field_names = _get_persisted_fields(self.DTOClass, include_pk=True)
+            if len(args) > len(field_names):
+                raise TypeError(
+                    f"Expected at most {len(field_names)} positional args, got {len(args)}"
+                )
+            for name, value in zip(field_names, args):
+                if name in kwargs:
+                    raise TypeError(f"Got multiple values for argument '{name}'")
+                kwargs[name] = value
+        return self._create(ExperimentTemplateDTO(**kwargs))
 
 
 class VectorRepository(_BaseRepository):
     DTOClass = VectorDTO
 
-    #over-ridden as vector_data must not be compared, this impacts the _create function as its called there
-    def existance_check(self,dto):
+    # over-ridden as vector_data must not be compared, this impacts the _create function as its called there
+    def existance_check(self, dto):
         if dto.vector_data is None:
             raise ValueError("vector_data must be provided")
         pk_field = _get_primary_key_field(self.DTOClass)
-        filt = convert_dto_into_filter(dto,exclude = [pk_field,"vector_data"])
+        filt = convert_dto_into_filter(dto, exclude=[pk_field, "vector_data"])
         matches = self.get_all(result_filter=filt)
-        if dto.seed is not None:
-            if matches:
-                dto.vector_id = matches[0].vector_id
-                return [dto]
+        if dto.seed is not None and matches:
+            dto.vector_id = matches[0].vector_id
+            return [dto]
         return matches
 
     def create_from_seed(
@@ -371,19 +281,20 @@ class VectorRepository(_BaseRepository):
 
 class ExperimentLiveInstanceRepository(_BaseRepository):
     DTOClass = ExperimentLiveInstanceDTO
+
     def __init__(
         self,
-        conn: Optional[sqlite3.Connection] = None,
+        conn: Optional[Session] = None,
         vector_repo: Optional[VectorRepository] = None,
     ):
         super().__init__(conn)
         self.vector_repo = vector_repo or VectorRepository(conn)
 
-    def existance_check(self,dto):
+    def existance_check(self, dto):
         if dto.vector_data is None:
-            raise ValueError("vector_data must be provided") #must it?
+            raise ValueError("vector_data must be provided")
         pk_field = _get_primary_key_field(self.DTOClass)
-        filt = convert_dto_into_filter(dto,exclude = [pk_field,"vector_data"])
+        filt = convert_dto_into_filter(dto, exclude=[pk_field, "vector_data"])
         matches = self.get_all(result_filter=filt)
         print(f"INFO LiveInstnace Matches Found, but new one being used: {len(matches)}")
         return []
@@ -424,9 +335,10 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
 
 class ExperimentSnapshotRepository(_BaseRepository):
     DTOClass = ExperimentSnapshotDTO
+
     def __init__(
         self,
-        conn: Optional[sqlite3.Connection] = None,
+        conn: Optional[Session] = None,
         vector_repo: Optional[VectorRepository] = None,
     ):
         super().__init__(conn)
@@ -453,74 +365,99 @@ class ExperimentSnapshotRepository(_BaseRepository):
 class GeneratedOutputRepository(_BaseRepository):
     DTOClass = GeneratedOutputDTO
 
+
 class MetricRepository(_BaseRepository):
     DTOClass = MetricDTO
 
-#probably just leave this alone
+
 class PromptRepository(_BaseRepository):
     DTOClass = PromptDTO
-    def create_group(self) -> PromptGroupDTO:
-        conn = self._conn()
-        cur = conn.cursor()
-        group_table = _table_name_for_dto(PromptGroupDTO)
-        insert_sql = _build_insert_sql(group_table, [])
-        cur.execute(insert_sql)
-        group = PromptGroupDTO(group_id=cur.lastrowid)
-        conn.commit()
-        self._close(conn)
-        return group
 
-    def get_prompts_from_group(self, group_id: int):  
-        conn = self._conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT p.prompt_id, p.text as text FROM Prompt p JOIN GroupPrompts g ON g.prompt_id = p.prompt_id WHERE g.group_id = ?",
-            (group_id,),
-        )
-        rows = cur.fetchall()
-        prompts = [_row_to_dto(PromptDTO, r) for r in rows]
-        cur.close()
-        self._close(conn)
-        return prompts
+    def create_group(self) -> PromptGroupDTO:
+        session, should_close = self._open_session()
+        try:
+            group = PromptGroupDTO()
+            session.add(group)
+            session.commit()
+            session.refresh(group)
+            return group
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self._close_session(session, should_close)
+
+    def get_prompts_from_group(self, group_id: int):
+        session, should_close = self._open_session()
+        try:
+            stmt = (
+                select(PromptDTO)
+                .join(GroupPromptLinkDTO, GroupPromptLinkDTO.prompt_id == PromptDTO.prompt_id)
+                .where(GroupPromptLinkDTO.group_id == group_id)
+            )
+            return list(session.scalars(stmt).all())
+        finally:
+            self._close_session(session, should_close)
 
     # shouldn't be used by user
     def add_dto_to_group(self, group_dto: PromptGroupDTO, prompt_dto: PromptDTO) -> None:
         if group_dto.group_id is None or prompt_dto.prompt_id is None:
             raise ValueError("Both group_id and prompt_id must be set")
-        conn = self._conn()
-        cur = conn.cursor()
 
-        link_dto = GroupPromptLinkDTO(group_id=group_dto.group_id, prompt_id=prompt_dto.prompt_id)
-        link_fields = _get_persisted_fields(GroupPromptLinkDTO, include_pk=False)
-        link_values = _dto_to_row(link_dto, include_fields=link_fields)
-        insert_sql = _build_insert_sql(_table_name_for_dto(GroupPromptLinkDTO), link_fields)
-        params = tuple(link_values[field] for field in link_fields)
-
-        cur.execute(insert_sql, params)
-        conn.commit()
-        self._close(conn)
+        session, should_close = self._open_session()
+        try:
+            link_dto = GroupPromptLinkDTO(
+                group_id=group_dto.group_id,
+                prompt_id=prompt_dto.prompt_id,
+            )
+            session.add(link_dto)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self._close_session(session, should_close)
 
     def create_group_from_dtos(self, prompts: List[PromptDTO]) -> PromptGroupDTO:  # assuming persisted dtos
-        conn = self._conn()
-        prompt_ids = sorted(set(prompt.prompt_id for prompt in prompts))
-        placeholders = ",".join("?" for _ in prompt_ids)
-        sql = f"""
-            SELECT gp.group_id
-            FROM GroupPrompts gp
-            WHERE gp.prompt_id IN ({placeholders})
-            GROUP BY gp.group_id
-            HAVING COUNT(DISTINCT gp.prompt_id) = ?
-            LIMIT 1
-            """
-        row = conn.execute(sql, [*prompt_ids, len(prompt_ids)]).fetchone()
-        group_id = row["group_id"] if row and hasattr(row, "keys") else (row[0] if row else None)
-        if group_id:
-            return PromptGroupDTO(group_id)
+        prompt_ids = sorted(set(prompt.prompt_id for prompt in prompts if prompt.prompt_id is not None))
+        if not prompt_ids:
+            raise ValueError("At least one persisted prompt DTO is required")
 
-        group = self.create_group()
-        for p in prompts:
-            self.add_dto_to_group(group, p)
-        return group
+        session, should_close = self._open_session()
+        try:
+            # Find a group containing exactly this prompt-id set.
+            candidate_group_ids = (
+                select(GroupPromptLinkDTO.group_id)
+                .where(GroupPromptLinkDTO.prompt_id.in_(prompt_ids))
+                .group_by(GroupPromptLinkDTO.group_id)
+                .having(func.count(distinct(GroupPromptLinkDTO.prompt_id)) == len(prompt_ids))
+            )
+
+            exact_group_stmt = (
+                select(GroupPromptLinkDTO.group_id)
+                .where(GroupPromptLinkDTO.group_id.in_(candidate_group_ids))
+                .group_by(GroupPromptLinkDTO.group_id)
+                .having(func.count(GroupPromptLinkDTO.prompt_id) == len(prompt_ids))
+                .limit(1)
+            )
+            group_id = session.scalar(exact_group_stmt)
+            if group_id is not None:
+                return session.get(PromptGroupDTO, group_id)
+
+            group = PromptGroupDTO()
+            session.add(group)
+            session.flush()
+            for prompt_id in prompt_ids:
+                session.add(GroupPromptLinkDTO(group_id=group.group_id, prompt_id=prompt_id))
+
+            session.commit()
+            session.refresh(group)
+            return group
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self._close_session(session, should_close)
 
     def create_group_from_strings(self, prompts: List[str]) -> PromptGroupDTO:
         prompt_dtos = [self._create(PromptDTO(text=s)) for s in prompts]
