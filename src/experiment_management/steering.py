@@ -33,7 +33,7 @@ class LiveInstance:
 
 
         self.module_name = self.live.experiment_template.module_name
-
+        self.experiment_instance_id = self.live.experiment_instance_id
         with torch.no_grad():
             self.live.vector_data = self.live.vector_data.detach().clone()
             self.vector_data.copy_(self.live.experiment_template.normalization*F.normalize(self.vector_data,dim=0))

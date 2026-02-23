@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional,Tuple
 
 import torch
 from sqlalchemy import Boolean, Float, ForeignKey, Integer, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.types import LargeBinary, TypeDecorator
+from sqlalchemy.types import LargeBinary, TypeDecorator, JSON
 
 from .utils import bytes_to_tensor, tensor_to_bytes
 
@@ -125,6 +125,8 @@ class Vector(Base):
     )
     vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob)
     seed: Mapped[Optional[int]] = mapped_column(Integer)
+    shape: Mapped[Optional[Tuple[int]]] = mapped_column(JSON, nullable=True)
+
 
     live_instances: Mapped[List[ExperimentLiveInstance]] = relationship(
         "ExperimentLiveInstance",
@@ -203,6 +205,7 @@ class GeneratedOutput(Base):
     text: Mapped[Optional[str]] = mapped_column(Text)
     snapshot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ExperimentSnapshot.snapshot_id"))
     vanilla: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
+    eos: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
     generation_details: Mapped[Optional[str]] = mapped_column(Text)
 
     prompt: Mapped[Optional[Prompt]] = relationship("Prompt", back_populates="generated_outputs")
