@@ -3,6 +3,7 @@ import sqlite3
 import io
 import random
 import torch
+from uuid import uuid4
 from dataclasses import fields
 
 from .db import get_connection
@@ -20,18 +21,6 @@ from .utils import tensor_to_bytes, bytes_to_tensor, make_repro_tensor
 
 #possibly refactor such that ids are not passed, apart from to the get methods of respective repos
 #so dtos are passed instead
-
-
-def _sql_literal(value):
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, float)):
-        return str(value)
-    escaped = str(value).replace("'", "''")
-    return f"'{escaped}'"
-
 
 def convert_dto_into_filter(
     dto,
@@ -51,13 +40,16 @@ def convert_dto_into_filter(
     return filt
 
 
-def build_predicates_from_filter(dto_type, filt: Optional[dict] = None) -> str:
+def build_predicates_from_filter(
+    dto_type, filt: Optional[dict] = None
+):
     if not filt:
-        return "1=1"
+        return ("1=1", {})
 
     dto_fields = {f.name for f in fields(dto_type)}
     allowed_ops = {"=", "!=", "<>", "<", "<=", ">", ">=", "LIKE", "IS", "IS NOT"}
     predicates = []
+    query_params = {}
     for field_name, constraints in filt.items():
         if field_name not in dto_fields:
             raise ValueError(f"Unknown filter field: {field_name}")
@@ -76,9 +68,14 @@ def build_predicates_from_filter(dto_type, filt: Optional[dict] = None) -> str:
                 predicates.append(f"{field_name} IS NOT NULL")
             else:
                 sql_op = "!=" if op_upper == "<>" else op_upper
-                predicates.append(f"{field_name} {sql_op} {_sql_literal(value)}")
 
-    return " AND ".join(predicates) if predicates else "1=1"
+                param_name = f"filter_{uuid4().hex}"
+                param_value = int(value) if isinstance(value, bool) else value
+                query_params[param_name] = param_value
+                predicates.append(f"{field_name} {sql_op} :{param_name}")
+
+    predicate_sql = " AND ".join(predicates) if predicates else "1=1"
+    return (predicate_sql, query_params)
 
 
 def build_orderby_from_filter(dto_type, orderby: Optional[dict] = None) -> str:
@@ -232,27 +229,33 @@ class ExperimentTemplateRepository(_BaseRepository):
         if "experiment_template_id" not in exclude:
             exclude.append("experiment_template_id")
 
-        filter_predicates = build_predicates_from_filter(
-            ExperimentTemplateDTO, result_filter
+        filter_predicates, filter_params = build_predicates_from_filter(
+            ExperimentTemplateDTO, result_filter, 
         )
         match_filter = convert_dto_into_filter(exclude=exclude, dto=et_dto)
-        match_predicates = build_predicates_from_filter(ExperimentTemplateDTO, match_filter)
+        match_predicates, match_params = build_predicates_from_filter(
+            ExperimentTemplateDTO, match_filter, 
+        )
         all_predicates = match_predicates + " AND " + filter_predicates
+        query_params = {}
+        query_params.update(match_params)
+        query_params.update(filter_params)
 
         # Exclude the input DTO itself from results.
         if et_dto.experiment_template_id is not None:
-            all_predicates += (
-                f" AND experiment_template_id != {et_dto.experiment_template_id}"
-            )
+            exclude_id_param = f"filter_{uuid4().hex}"
+            all_predicates += f" AND experiment_template_id != :{exclude_id_param}"
+            query_params[exclude_id_param] = et_dto.experiment_template_id
         else:
             self_filter = convert_dto_into_filter(
                 exclude=[],
                 dto=et_dto,
             )
-            self_predicates = build_predicates_from_filter(
-                ExperimentTemplateDTO, self_filter
+            self_predicates, self_params = build_predicates_from_filter(
+                ExperimentTemplateDTO, self_filter, 
             )
             all_predicates += f" AND NOT ({self_predicates})"
+            query_params.update(self_params)
 
         order_clause = build_orderby_from_filter(ExperimentTemplateDTO, orderby)
 
@@ -263,7 +266,8 @@ class ExperimentTemplateRepository(_BaseRepository):
             SELECT {", ".join(template_columns)}
             FROM ExperimentTemplate
             WHERE {all_predicates}{order_clause}
-            """
+            """,
+            query_params,
         )
         rows = cur.fetchall()
         self._close(conn)
@@ -460,15 +464,18 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
         exclude = [name for name in template_fields if name != "experiment_template_id"]
 
         match_filter = convert_dto_into_filter(dto=et_dto, exclude=exclude)
-        match_predicates = build_predicates_from_filter(
-            ExperimentLiveInstanceDTO, match_filter
+        match_predicates, match_params = build_predicates_from_filter(
+            ExperimentLiveInstanceDTO, match_filter, 
         )#matches only the id
 
-        filter_predicates = build_predicates_from_filter(
-            ExperimentLiveInstanceDTO, result_filter
+        filter_predicates, filter_params = build_predicates_from_filter(
+            ExperimentLiveInstanceDTO, result_filter, 
         )
         all_predicates = match_predicates + " AND " + filter_predicates
         order_clause = build_orderby_from_filter(ExperimentLiveInstanceDTO, orderby)
+        query_params = {}
+        query_params.update(match_params)
+        query_params.update(filter_params)
 
         conn = self._conn()
         cur = conn.cursor()
@@ -482,7 +489,8 @@ class ExperimentLiveInstanceRepository(_BaseRepository):
                 experiment_template_id
             FROM ExperimentLiveInstance
             WHERE {all_predicates}{order_clause}
-            """
+            """,
+            query_params,
         )
         rows = cur.fetchall()
         self._close(conn)
@@ -571,14 +579,17 @@ class ExperimentSnapshotRepository(_BaseRepository):
         exclude = [name for name in live_fields if name != "experiment_instance_id"]
 
         match_filter = convert_dto_into_filter(dto=live_dto, exclude=exclude)
-        match_predicates = build_predicates_from_filter(
-            ExperimentSnapshotDTO, match_filter
+        match_predicates, match_params = build_predicates_from_filter(
+            ExperimentSnapshotDTO, match_filter, 
         )
-        filter_predicates = build_predicates_from_filter(
-            ExperimentSnapshotDTO, result_filter
+        filter_predicates, filter_params = build_predicates_from_filter(
+            ExperimentSnapshotDTO, result_filter, 
         )
         all_predicates = match_predicates + " AND " + filter_predicates
         order_clause = build_orderby_from_filter(ExperimentSnapshotDTO, orderby)
+        query_params = {}
+        query_params.update(match_params)
+        query_params.update(filter_params)
 
         conn = self._conn()
         cur = conn.cursor()
@@ -591,7 +602,8 @@ class ExperimentSnapshotRepository(_BaseRepository):
                 experiment_instance_id
             FROM ExperimentSnapshot
             WHERE {all_predicates}{order_clause}
-            """
+            """,
+            query_params,
         )
         rows = cur.fetchall()
         self._close(conn)
@@ -696,14 +708,18 @@ class GeneratedOutputRepository(_BaseRepository):
         exclude = [name for name in snap_fields if name != "snapshot_id"]
 
         match_filter = convert_dto_into_filter(dto=snap_dto, exclude=exclude)
-        match_predicates = build_predicates_from_filter(
-            GeneratedOutputDTO, match_filter
+        match_predicates, match_params = build_predicates_from_filter(
+            GeneratedOutputDTO, match_filter, 
         )
-        filter_predicates = build_predicates_from_filter(
-            GeneratedOutputDTO, result_filter
+        filter_predicates, filter_params = build_predicates_from_filter(
+            GeneratedOutputDTO, result_filter, 
         )
         all_predicates = match_predicates + " AND " + filter_predicates
         order_clause = build_orderby_from_filter(GeneratedOutputDTO, orderby)
+
+        merged_params = {}
+        merged_params.update(match_params)
+        merged_params.update(filter_params)
 
         conn = self._conn()
         cur = conn.cursor()
@@ -718,7 +734,8 @@ class GeneratedOutputRepository(_BaseRepository):
                 generation_details
             FROM GeneratedOutput
             WHERE {all_predicates}{order_clause}
-            """
+            """,
+            merged_params,
         )
         rows = cur.fetchall()
         self._close(conn)
