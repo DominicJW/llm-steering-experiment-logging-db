@@ -1,23 +1,11 @@
-from typing import Callable,Dict,Type
-import json
-from torch import optim
+from .utils import (
+    loss_factory,
+    loss_registry,
+    optimizer_factory,
+    optimizer_registry,
+    register_loss_fn,
+)
 
-loss_registry : Dict[str,Callable] = {}
 
-def register_loss_fn(name:str, function:Callable):
-    loss_registry[name] = function
-
-def loss_factory(name:str,kwargs:str):
-    kwargs = json.loads(kwargs)
-    loss_fn = loss_registry[name]
-    return lambda steered_output,vanilla_output,input_ids : loss_fn(
-        steered_output, vanilla_output, input_ids, **kwargs
-    )
-    
-    
-optimizer_registry : Dict[str,Type[optim.Optimizer]] = {"AdamW":optim.AdamW}
-
-def optimizer_factory(name:str,kwargs:str):
-    kwargs = json.loads(kwargs)
-    optimizer_class = optimizer_registry[name]
-    return lambda parameter_list : optimizer_class(parameter_list,**kwargs)
+def register_optimizer(name, optimizer_class):
+    optimizer_registry[name] = optimizer_class

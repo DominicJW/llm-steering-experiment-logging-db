@@ -1,0 +1,143 @@
+import random
+from typing import Optional, Tuple
+
+import torch
+
+from .orm import (
+    Base,
+    ExperimentLiveInstance,
+    ExperimentSnapshot,
+    ExperimentTemplate,
+    GeneratedOutput,
+    Metric,
+    Prompt,
+    PromptGroup,
+    PromptGroupItem,
+    VanillaBaseline,
+    Vector,
+)
+from .repositories import BaseRepository, VectorRepository
+from .utils import make_repro_tensor
+
+
+class BaseService:
+    Model = Base
+    Repository = BaseRepository
+
+    @classmethod
+    def _repo(cls):
+        return cls.Repository(cls.Model)
+
+    @classmethod
+    def persist(cls, model):
+        matching = cls.find_matching(model, excluded=[])
+        if matching:
+            return matching[0]
+        return cls._repo().persist(model, load_relationships=True)
+
+    @classmethod
+    def create_non_persisted(cls, **kwargs):
+        return cls.Model(**kwargs)
+
+    @classmethod
+    def create_persisted(cls, **kwargs):
+        model = cls.create_non_persisted(**kwargs)
+        return cls.persist(model)
+
+    @classmethod
+    def refresh_all(cls, model):
+        return cls._repo().refresh_all(model)
+
+    @classmethod
+    def find_matching(cls, model, excluded=None):
+        return cls._repo().find_matching(model, excluded)
+
+    @classmethod
+    def find_by(cls, criteria, load_relationships: bool = False):
+        return cls._repo().find_by(criteria, load_relationships=load_relationships)
+
+
+class ExperimentTemplateService(BaseService):
+    Model = ExperimentTemplate
+
+
+class ExperimentLiveInstanceService(BaseService):
+    Model = ExperimentLiveInstance
+
+    @classmethod
+    def update(cls, model):
+        return cls._repo().update(model, load_relationships=True)
+
+
+class VanillaBaselineService(BaseService):
+    Model = VanillaBaseline
+
+
+class ExperimentSnapshotService(BaseService):
+    Model = ExperimentSnapshot
+
+
+class GeneratedOutputService(BaseService):
+    Model = GeneratedOutput
+
+
+class MetricService(BaseService):
+    Model = Metric
+
+
+class VectorService(BaseService):
+    Model = Vector
+    Repository = VectorRepository
+
+    @classmethod
+    def find_matching(cls, model, excluded=None):
+        # Only de-dupe reproducible vectors where both seed and shape are set.
+        # If seed is None (e.g. ad-hoc tensor snapshots), always persist a new vector.
+        if model.seed is None or model.shape is None:
+            return []
+        excluded_keys = list(excluded or [])
+        excluded_keys.append("vector_data")
+        return super().find_matching(model, excluded=excluded_keys)
+
+    @classmethod
+    def create_non_persisted(
+        cls,
+        seed: Optional[int] = None,
+        shape: Optional[Tuple[int, ...] | torch.Size] = None,
+        tensor: Optional[torch.Tensor] = None,
+    ):
+        if tensor is not None:
+            shape = tuple(tensor.shape)
+            seed = None
+        else:
+            if seed is None:
+                seed = random.randint(1, int(1e8))
+            if shape is None:
+                raise ValueError("shape or tensor is required")
+            shape = tuple(shape)
+            tensor = make_repro_tensor(shape=shape, seed=seed)
+        return super().create_non_persisted(seed=seed, shape=shape, vector_data=tensor)
+
+
+class PromptService(BaseService):
+    Model = Prompt
+
+
+class PromptGroupItemService(BaseService):
+    Model = PromptGroupItem
+
+
+class PromptGroupService(BaseService):
+    Model = PromptGroup
+
+    @classmethod
+    def create_from_strings(cls, strings=None):
+        prompt_texts = list(strings or [])
+        prompts = [PromptService.create_persisted(text=text) for text in prompt_texts]
+        group = cls.create_persisted()
+        for prompt in prompts:
+            PromptGroupItemService.create_persisted(
+                group_id=group.group_id,
+                prompt_id=prompt.prompt_id,
+            )
+        return cls.refresh_all(group)

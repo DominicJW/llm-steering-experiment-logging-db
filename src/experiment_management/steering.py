@@ -3,15 +3,19 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import List, Tuple, Union,Dict,Callable,Type
+from typing import Callable, Dict, List, Type
 import warnings
 
 import torch
 import torch.nn.functional as F
 
 from .orm import ExperimentLiveInstance
-from .factories import loss_factory, optimizer_factory
-from .utils import slice_batch_output
+from .services import (
+    ExperimentLiveInstanceService,
+    ExperimentSnapshotService,
+    VectorService,
+)
+from .utils import slice_batch_output, loss_factory, optimizer_factory
 
 #the optimizer is optimizing a specific tensor
 #I am seeing a risk for problems
@@ -31,20 +35,30 @@ class LiveInstance:
         self.live = live
         self.last_snapshot = None
 
+        self.live = ExperimentLiveInstanceService.refresh_all(self.live) #loads the relationships
+        if self.live.vector_data is None:
+            raise ValueError("live.vector_data is None; initialize the live instance vector before steering")
+
+        normalization = self.live.experiment_template.normalization
+        if normalization is None or normalization <= 0:
+            raise ValueError(f"normalization must be > 0, got {normalization}")
 
         self.module_name = self.live.experiment_template.module_name
-        self.experiment_instance_id = self.live.experiment_instance_id
         with torch.no_grad():
             self.live.vector_data = self.live.vector_data.detach().clone()
-            self.vector_data.copy_(self.live.experiment_template.normalization*F.normalize(self.vector_data,dim=0))
+            self.vector_data.copy_(normalization * F.normalize(self.vector_data,dim=0))
         self.vector_data.requires_grad_(True)
 
         # build loss & optimizer from the template
+        loss_kwargs = self.live.experiment_template.loss_additional_parameters or {}
         self.loss_fn = loss_factory(
-            self.live.experiment_template.loss_name, self.live.experiment_template.loss_additional_parameters
+            self.live.experiment_template.loss_name,
+            **loss_kwargs,
         )
+        optimizer_kwargs = self.live.experiment_template.optimizer_additional_parameters or {}
         self.optimizer_constructor = optimizer_factory(
-            self.live.experiment_template.optimizer_name, self.live.experiment_template.optimizer_additional_parameters
+            self.live.experiment_template.optimizer_name,
+            **optimizer_kwargs,
         )
         self.optimizer = self.optimizer_constructor([self.vector_data])
         self.optimizer.zero_grad()
@@ -53,11 +67,13 @@ class LiveInstance:
     def step_optimizer(self):
         if self.vector_data.grad is None:
             warnings.warn(f"None gradient encountered in LiveInstance.step_optimizer {self.live}")
+            return
+        normalization = self.live.experiment_template.normalization
         with torch.no_grad():
-            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (self.live.experiment_template.normalization**2))
+            self.vector_data.grad.sub_(torch.dot(self.vector_data.grad, self.vector_data) * self.vector_data / (normalization**2))
         self.optimizer.step()
         with torch.no_grad():
-            self.vector_data.copy_(self.live.experiment_template.normalization*F.normalize(self.vector_data,dim=0))
+            self.vector_data.copy_(normalization * F.normalize(self.vector_data,dim=0))
         self.optimizer.zero_grad()
 
     @property
@@ -73,25 +89,21 @@ class LiveInstance:
         self.live.iteration_count = value
 
     def create_snapshot(self,save_vector=False):
-        if save_vector:    
-            vector = Vector(self.vector_data)
-            with Session(engine):
-                session.add(vector)
-                session.commit()
-                session.refresh(vector)
-        else:
-            vector = None
-
-        with Session(engine):
-            self.last_snapshot = ExperimentSnapshot(
-                vector=vector,
-                iteration_count=self.iteration_count,
-                live_instance=self.live,
+        vector_id = None
+        if save_vector:
+            vector = VectorService.create_persisted(
+                tensor=self.vector_data.detach().clone()
             )
-            session.add(self.last_snapshot)
-            session.commit()
-            session.refresh(self.last_snapshot)
+            vector_id = vector.vector_id
+        self.last_snapshot = ExperimentSnapshotService.create_persisted(
+                vector_id=vector_id,
+                iteration_count=self.iteration_count,
+                experiment_instance_id=self.live.experiment_instance_id,
+        )
         return self.last_snapshot
+
+    def update(self):
+        self.live = ExperimentLiveInstanceService.update(self.live)
 
 
 class BatchSteer:
@@ -100,7 +112,9 @@ class BatchSteer:
     inject the learned vectors into the model, and aggregates per‑instance loss.
     """
 
-    def __init__(self, live_objs: List[LiveInstance], model: Type[torch.nn.Module]):#actually meant to be transformer
+    def __init__(self, live_objs: List[LiveInstance], model):#actually meant to be transformer
+        if  len(live_objs) > 0:
+            ValueError("live_objs cannot be empty")
         self.live_objs = live_objs
         self.inst_id_to_slice: dict[int, slice] = {}
         # All instances are expected to share the same batch size
@@ -115,23 +129,21 @@ class BatchSteer:
         self.module_to_hookfn = {}
         # Group vectors by the submodule they should be injected into
         module_to_instlist = defaultdict(list)
-        module_to_veclist = defaultdict(list)
         for live_obj in self.live_objs:
             module_to_instlist[live_obj.module_name].append(live_obj)
-            module_to_veclist[live_obj.module_name].append(
-                live_obj.vector_data.unsqueeze(0).to(dtype = self.model.dtype,device=self.model.device) #that is a copy 
-            )
 
         start = 0
         tensor_start = start
-        for module,veclist in module_to_veclist.items():
-            tensor = torch.concat(veclist, dim=0)  # (num_vecs, width)
-            for i, _ in enumerate(veclist):
-                inst_id = module_to_instlist[module][i].experiment_instance_id
+        for module,live_objs in module_to_instlist.items():
+            vector_list = []
+            for live in live_objs:
+                vector_list.append(live.vector_data)
+                inst_id = live.experiment_instance_id
                 self.inst_id_to_slice[inst_id] = slice(
                     start, start + self.num_prompts_in_batch
                 )
                 start += self.num_prompts_in_batch
+            tensor = torch.concat(vector_list,dim=0) # (num_vecs, width)
             tensor_slice = slice(tensor_start,start)
             tensor_start = start
             self.module_to_hookfn[module] = self._make_hookfn(tensor,tensor_slice)
@@ -144,11 +156,10 @@ class BatchSteer:
         Returns a forward‑hook that appends the learned vector (broadcasted)
         to the module’s output.
         """
-
+        stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1)# (num_vecs*num_prompts, width)
         def hook(module, inp, output):
-            stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1)# (num_vecs*num_prompts, width)
-            batch_slice = tensor_slice
             stacked_vectors = stacked_vectors.unsqueeze(1)  # (num_vecs*num_prompts, 1, width)
+            batch_slice = tensor_slice
             output[batch_slice] = output[batch_slice] + stacked_vectors #inplace modificatin of output
             return output
 
@@ -194,3 +205,51 @@ class BatchSteer:
                 h.remove()
                 
     
+
+
+
+# ---------------------------------------------------------------------------
+# BatchSteer compatibility shim
+# ---------------------------------------------------------------------------
+class BatchSteerCompat(BatchSteer):
+    """Reference-safe shim for current BatchSteer behavior while keeping same semantics."""
+
+    def __init__(self, live_objs: List[LiveInstance], model):
+        if not live_objs:
+            raise ValueError("live_objs cannot be empty")
+        super().__init__(live_objs, model)
+
+    def _make_hookfns(self):
+        self.inst_id_to_slice = {}
+        self.module_to_hookfn = {}
+
+        module_to_lives = defaultdict(list)
+        for live_obj in self.live_objs:
+            module_to_lives[live_obj.module_name].append(live_obj)
+
+        start = 0
+        tensor_start = 0
+        for module_name, module_lives in module_to_lives.items():
+            vectors = [
+                live_obj.vector_data.unsqueeze(0).to(dtype=self.model.dtype, device=self.model.device)
+                for live_obj in module_lives
+            ]
+            tensor = torch.concat(vectors, dim=0)
+
+            for live_obj in module_lives:
+                inst_id = live_obj.experiment_instance_id
+                self.inst_id_to_slice[inst_id] = slice(start, start + self.num_prompts_in_batch)
+                start += self.num_prompts_in_batch
+
+            tensor_slice = slice(tensor_start, start)
+            tensor_start = start
+            self.module_to_hookfn[module_name] = self._make_hookfn(tensor, tensor_slice)
+
+    def _make_hookfn(self, tensor: torch.Tensor, tensor_slice: slice):
+        stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1).unsqueeze(1)
+
+        def hook(_module, _inp, output):
+            output[tensor_slice] = output[tensor_slice] + stacked_vectors
+            return output
+
+        return hook
