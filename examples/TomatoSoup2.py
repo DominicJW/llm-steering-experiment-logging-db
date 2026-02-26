@@ -270,6 +270,8 @@ def create_detailed_metrics(vanilla_inputs,vanilla_generated_outputs: List[Gener
             generated_output_id=generated_output.output_id,
         )
         perplexity = perplexity_from_token_ids(all_ids,model=model,mask=mask_for_perplexity)  #returns a float
+
+        #get the snapshot what generated the text from the generated_output_id
         MetricService.create_persisted(
             value=perplexity, 
             description="perplexity_vanilla_on_steered_generated_text",
@@ -322,7 +324,5 @@ def train():
         if step % 500 == 0:
             create_detailed_metrics()
 
-if __name__ == "main":
+if __name__ == "__main__":
     main()
-
-main()

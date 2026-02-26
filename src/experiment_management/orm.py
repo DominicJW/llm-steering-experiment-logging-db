@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, Text
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, Text, and_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import LargeBinary, TypeDecorator, JSON
 
@@ -81,6 +81,7 @@ class PromptGroup(Base):
         primaryjoin="PromptGroup.group_id == PromptGroupItem.group_id",
         secondaryjoin="Prompt.prompt_id == PromptGroupItem.prompt_id",
         lazy="selectin",
+        viewonly=True
     )
 
 
@@ -121,7 +122,17 @@ class ExperimentTemplate(Base):
         "PromptGroup",
         foreign_keys=[group_id],
         lazy="selectin",
+        viewonly=True
     )
+
+    prompt_group: Mapped[PromptGroup] = relationship(
+        "PromptGroup",
+        foreign_keys=[group_id],
+        lazy="selectin",
+        viewonly=True
+    )
+
+
 
 class Vector(Base):
     __tablename__ = "Vector"
@@ -136,33 +147,6 @@ class Vector(Base):
     shape: Mapped[Optional[Tuple[int]]] = mapped_column(JSON, nullable=False)
 
 
-class ExperimentLiveInstance(Base):
-    __tablename__ = "ExperimentLiveInstance"
-
-    experiment_instance_id: Mapped[Optional[int]] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-    vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob,nullable=True)
-    initial_vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vector.vector_id"),nullable=False)
-    iteration_count: Mapped[Optional[int]] = mapped_column(Integer, default=0,nullable=False)
-    experiment_template_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("ExperimentTemplate.experiment_template_id"),nullable=False
-    )
-
-    experiment_template: Mapped[ExperimentTemplate] = relationship(
-        "ExperimentTemplate",
-        foreign_keys=[experiment_template_id],
-        lazy="selectin",
-    )
-
-
-    snapshots: Mapped[List[ExperimentSnapshot]] = relationship(
-        "ExperimentSnapshot",
-        foreign_keys="ExperimentSnapshot.experiment_instance_id",
-        lazy="selectin",
-    )
 
 
 class VanillaBaseline(Base):
@@ -209,11 +193,58 @@ class ExperimentSnapshot(Base):
         "GeneratedOutput",
         foreign_keys="GeneratedOutput.snapshot_id",
         lazy="selectin",
+        viewonly=True
     )
     metrics: Mapped[List[Metric]] = relationship(
         "Metric",
         foreign_keys="Metric.snapshot_id",
         lazy="selectin",
+        viewonly=True
+    )
+
+
+class ExperimentLiveInstance(Base):
+    __tablename__ = "ExperimentLiveInstance"
+
+    experiment_instance_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    vector_data: Mapped[Optional[torch.Tensor]] = mapped_column(TensorBlob,nullable=True)
+    initial_vector_id: Mapped[Optional[int]] = mapped_column(ForeignKey("Vector.vector_id"),nullable=False)
+    iteration_count: Mapped[Optional[int]] = mapped_column(Integer, default=0,nullable=False)
+    experiment_template_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ExperimentTemplate.experiment_template_id"),nullable=False
+    )
+
+    experiment_template: Mapped[ExperimentTemplate] = relationship(
+        "ExperimentTemplate",
+        foreign_keys=[experiment_template_id],
+        lazy="selectin",
+        viewonly=True
+    )
+
+
+    snapshots: Mapped[List[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
+        foreign_keys="ExperimentSnapshot.experiment_instance_id",
+        lazy="selectin",
+        viewonly=True
+    )
+    #must be defined after ExperimentSnapshot in this file
+    parent_snapshot: Mapped[Optional[ExperimentSnapshot]] = relationship(
+        "ExperimentSnapshot",
+        primaryjoin=initial_vector_id == Vector.vector_id,
+        secondary=Vector.__table__,
+        secondaryjoin=and_(
+            Vector.vector_id == ExperimentSnapshot.vector_id,
+            ExperimentSnapshot.iteration_count > 0,
+        ),
+        viewonly=True,
+        uselist=False,
+        lazy="selectin",
+        order_by=ExperimentSnapshot.iteration_count.desc(),
     )
 
 
@@ -236,7 +267,16 @@ class GeneratedOutput(Base):
         "Prompt",
         foreign_keys=[prompt_id],
         lazy="selectin",
+        viewonly=True
     )
+
+    metrics: Mapped[List[Metric]] = relationship(
+        "Metric",
+        foreign_keys="Metric.generated_output_id",
+        lazy="selectin",
+        viewonly=True
+    )
+
 
 class Metric(Base):
     __tablename__ = "Metric"
@@ -265,9 +305,11 @@ class Metric(Base):
         "Prompt",
         foreign_keys=[prompt_id],
         lazy="selectin",
+        viewonly=True
     )
     generated_output : Mapped[Optional[GeneratedOutput]] = relationship(
         "GeneratedOutput",
         foreign_keys=[generated_output_id],
         lazy="selectin",
+        viewonly=True
     )

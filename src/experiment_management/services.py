@@ -55,6 +55,8 @@ class BaseService:
     @classmethod
     def find_by(cls, criteria, load_relationships: bool = False):
         return cls._repo().find_by(criteria, load_relationships=load_relationships)
+    
+
 
 
 class ExperimentTemplateService(BaseService):
@@ -67,6 +69,22 @@ class ExperimentLiveInstanceService(BaseService):
     @classmethod
     def update(cls, model):
         return cls._repo().update(model, load_relationships=True)
+
+    @classmethod
+    def create_persisted_from_snap(cls,snapshot=None,**kwargs):
+        if snapshot is None:
+            raise ValueError("snapshot argument not set, use create_persisted method instead")
+        if snapshot.vector_id is None:
+            raise ValueError("Snapshot vector_id cannot be none when initalising from snapshot")
+        if snapshot.iteration_count == 0:
+            raise ValueError("Snapshot iteration count must be greater than 0 when initalising from snapshot")
+        if "initial_vector_id" in kwargs.keys():
+            if kwargs["initial_vector_id"] != snapshot.vector_id: #forgive user for passing both as long as they are the same
+                raise ValueError("Cannot initialise from both initial vector and snapshot")
+            del kwargs["initial_vector_id"]
+        live_instance = cls.create_persisted(initial_vector_id=snapshot.vector_id,**kwargs)
+        return cls.refresh_all(live_instance)
+        
 
 
 class VanillaBaselineService(BaseService):
