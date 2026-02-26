@@ -32,7 +32,7 @@ class LiveInstance:
         self,
         live: ExperimentLiveInstance,
     ):
-        self.live = live
+        self.live = live #should choose bettr name
         self.last_snapshot = None
 
         self.live = ExperimentLiveInstanceService.refresh_all(self.live) #loads the relationships
@@ -138,31 +138,29 @@ class BatchSteer:
             vector_list = []
             for live in live_objs:
                 vector_list.append(live.vector_data)
-                inst_id = live.experiment_instance_id
+                inst_id = live.live.experiment_instance_id
                 self.inst_id_to_slice[inst_id] = slice(
                     start, start + self.num_prompts_in_batch
                 )
                 start += self.num_prompts_in_batch
-            tensor = torch.concat(vector_list,dim=0) # (num_vecs, width)
+            tensor = torch.concat([vec.unsqueeze(0) for vec in vector_list],dim=0) # (num_vecs, width)
             tensor_slice = slice(tensor_start,start)
             tensor_start = start
-            self.module_to_hookfn[module] = self._make_hookfn(tensor,tensor_slice)
+            stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1)# (num_vecs*num_prompts, width)
+            stacked_vectors = stacked_vectors.unsqueeze(1)
+            self.module_to_hookfn[module] = self._make_hookfn(stacked_vectors,tensor_slice)
 
     # ----------------------------------------------------------------------
     # Hook creation
     # ----------------------------------------------------------------------
-    def _make_hookfn(self, tensor: torch.Tensor,tensor_slice: slice):
+    def _make_hookfn(self, stacked_vectors: torch.Tensor,tensor_slice: slice):
         """
         Returns a forward‑hook that appends the learned vector (broadcasted)
         to the module’s output.
         """
-        stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1)# (num_vecs*num_prompts, width)
         def hook(module, inp, output):
-            stacked_vectors = stacked_vectors.unsqueeze(1)  # (num_vecs*num_prompts, 1, width)
-            batch_slice = tensor_slice
-            output[batch_slice] = output[batch_slice] + stacked_vectors #inplace modificatin of output
+            output[tensor_slice,:,:] = output[tensor_slice,:,:] + stacked_vectors.to(device = self.model.device,dtype = self.model.dtype) #inplace modificatin of output
             return output
-
         return hook
 
 
@@ -203,53 +201,3 @@ class BatchSteer:
         finally:
             for h in handles:
                 h.remove()
-                
-    
-
-
-
-# ---------------------------------------------------------------------------
-# BatchSteer compatibility shim
-# ---------------------------------------------------------------------------
-class BatchSteerCompat(BatchSteer):
-    """Reference-safe shim for current BatchSteer behavior while keeping same semantics."""
-
-    def __init__(self, live_objs: List[LiveInstance], model):
-        if not live_objs:
-            raise ValueError("live_objs cannot be empty")
-        super().__init__(live_objs, model)
-
-    def _make_hookfns(self):
-        self.inst_id_to_slice = {}
-        self.module_to_hookfn = {}
-
-        module_to_lives = defaultdict(list)
-        for live_obj in self.live_objs:
-            module_to_lives[live_obj.module_name].append(live_obj)
-
-        start = 0
-        tensor_start = 0
-        for module_name, module_lives in module_to_lives.items():
-            vectors = [
-                live_obj.vector_data.unsqueeze(0).to(dtype=self.model.dtype, device=self.model.device)
-                for live_obj in module_lives
-            ]
-            tensor = torch.concat(vectors, dim=0)
-
-            for live_obj in module_lives:
-                inst_id = live_obj.experiment_instance_id
-                self.inst_id_to_slice[inst_id] = slice(start, start + self.num_prompts_in_batch)
-                start += self.num_prompts_in_batch
-
-            tensor_slice = slice(tensor_start, start)
-            tensor_start = start
-            self.module_to_hookfn[module_name] = self._make_hookfn(tensor, tensor_slice)
-
-    def _make_hookfn(self, tensor: torch.Tensor, tensor_slice: slice):
-        stacked_vectors = tensor.repeat(self.num_prompts_in_batch, 1).unsqueeze(1)
-
-        def hook(_module, _inp, output):
-            output[tensor_slice] = output[tensor_slice] + stacked_vectors
-            return output
-
-        return hook

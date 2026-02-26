@@ -30,6 +30,30 @@ class TensorBlob(TypeDecorator):
             return None
         return bytes_to_tensor(value)
 
+class TokenIDs(TypeDecorator):
+    """Store torch.Tensor (dtype=int) as JSON in SQLite JSON columns."""
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        # Convert torch.Tensor -> Python list for JSON storage
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu().to(torch.int64)
+            return tensor.tolist()
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        raise TypeError("TokenIDs expects a torch.Tensor or list/tuple of ints")
+
+    def process_result_value(self, value, dialect):
+        # Convert stored JSON (list) -> torch.Tensor(dtype=torch.int64)
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = json.loads(value)
+        return torch.tensor(value, dtype=torch.int64)
+
 
 class Prompt(Base):
     __tablename__ = "Prompt"
@@ -129,7 +153,7 @@ class ExperimentLiveInstance(Base):
 
     experiment_template: Mapped[ExperimentTemplate] = relationship(
         "ExperimentTemplate",
-        foreign_keys="ExperimentTemplate.experiment_template_id",
+        foreign_keys=[experiment_template_id],
         lazy="selectin",
     )
 
@@ -206,8 +230,8 @@ class GeneratedOutput(Base):
     snapshot_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ExperimentSnapshot.snapshot_id"),nullable=False)
     eos: Mapped[Optional[bool]] = mapped_column(Boolean, default=True)
     generation_details: Mapped[Optional[str]] = mapped_column(Text,default="")
-    token_ids: Mapped[Optional[str]] = mapped_column(JSON) #new #should use cutom type decorator
-
+    token_ids: Mapped[Optional[torch.Tensor]] = mapped_column(TokenIDs,nullable=False)
+    
     prompt : Mapped[Prompt] = relationship(
         "Prompt",
         foreign_keys=[prompt_id],

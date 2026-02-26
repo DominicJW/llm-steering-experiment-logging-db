@@ -21,6 +21,7 @@ def make_repro_tensor(
     seed: int = 42,
     device: str = "cpu",
     dtype=torch.float32,
+    **kwargs
 ) -> torch.Tensor:
     cpu_state = torch.get_rng_state()
     cuda_state = None
