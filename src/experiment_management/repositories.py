@@ -9,7 +9,7 @@ class BaseRepository:
     def __init__(self, model):
         self.Model = model
 
-    def _relationship_options(self) -> tuple:
+    def _relationship_options(self,excluded_relationships=[]) -> tuple:
         rels = inspect(self.Model).relationships
         return tuple(selectinload(getattr(self.Model, rel.key)) for rel in rels)
 
@@ -22,7 +22,7 @@ class BaseRepository:
             return self.refresh_all(model)
         return model
 
-    def select_filter(self, criteria: Dict[str, Any], load_relationships: bool = False):
+    def select_filter(self, criteria: Dict[str, Any], load_relationships: bool = False,excluded_relationships=[]):
         options = self._relationship_options() if load_relationships else tuple()
         with get_session() as session:
             stmt = select(self.Model).filter_by(**criteria).options(*options)
@@ -50,7 +50,7 @@ class BaseRepository:
             criteria[key] = state.attrs[key].value
         return self.find_by(criteria)
 
-    def refresh_all(self, model):
+    def refresh_all(self, model,excluded_relationships=[]):
         state = inspect(model)
         criteria: Dict[str, Any] = {}
         for pk in state.mapper.primary_key:
@@ -60,7 +60,7 @@ class BaseRepository:
                 raise ValueError("primary key is None, unpersisted object cannot be refreshed")
             criteria[key] = value
 
-        result = self.select_filter(criteria, load_relationships=True)
+        result = self.select_filter(criteria, load_relationships=True,excluded_relationships=excluded_relationships)
         if not result:
             raise LookupError("object not found during refresh_all")
         return result[0]

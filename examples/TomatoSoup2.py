@@ -105,7 +105,8 @@ def create_input_mask(tokens,a=3,b=4):
     return return_value
 
 
-PROMPTS = ["Write a recipe for onion soup"]
+# PROMPTS = ["Write a recipe for onion soup"]
+PROMPTS = ["Write a recipe for tomato soup"]
 SEEDS = [58203, 14324, 95232, 85312, 45925]
 NORMALIZATION_VALUES = [float(n) for n in range(1, 15)]
 MAX_NEW_TOKENS = 48
@@ -216,7 +217,7 @@ def main():
         template = ExperimentTemplateService.create_persisted(
             normalization=normalization,
             **base_template,
-        )
+        ) #this seems to be adding the new prompt to an existing experiment_template
         live_objs = []
         for vector in vectors:
             live = ExperimentLiveInstanceService.create_persisted(

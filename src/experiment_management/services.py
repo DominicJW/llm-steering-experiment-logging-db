@@ -152,10 +152,39 @@ class PromptGroupService(BaseService):
     def create_from_strings(cls, strings=None):
         prompt_texts = list(strings or [])
         prompts = [PromptService.create_persisted(text=text) for text in prompt_texts]
-        group = cls.create_persisted()
+        group = cls.create_non_persisted()
+        groups = PromptGroupService.find_matching(group,excluded=["group_id"]) #gets all groups
+        group_ids_set = set(g.group_id for g in groups)
         for prompt in prompts:
-            PromptGroupItemService.create_persisted(
-                group_id=group.group_id,
+            prompt_group_item = PromptGroupItemService.create_non_persisted(
                 prompt_id=prompt.prompt_id,
             )
-        return cls.refresh_all(group)
+            existing_prompt_group_items = PromptGroupItemService.find_matching(prompt_group_item,excluded=["group_id"])
+            group_ids_set = group_ids_set - set(item.group_id for item in existing_prompt_group_items)
+
+
+        if len(group_ids_set) == 0: #means there is no group which has all prompts in group
+            group = cls.persist(group)
+            for prompt in prompts:
+                PromptGroupItemService.create_persisted(group_id = group.group_id,prompt_id=prompt.prompt_id)
+            return cls.refresh_all(group)
+        
+        else: #there is a group which has all prompts in group (and possibly more)
+            for group_id in group_ids_set:
+                temp = PromptGroupItemService.create_non_persisted(group_id=group_id)
+                prompt_group_items = PromptGroupItemService.find_matching(temp,excluded=["prompt_id"]) #gets all prompt_ids associated with group
+                extra_prompts = set(item.prompt_id for item in prompt_group_items) - set(prompt.prompt_id for prompt in prompts)
+                if len(extra_prompts) == 0: #there is a matching group
+                    group = cls.create_non_persisted(group_id=group_id)
+                    return cls.refresh_all(cls._repo().find_matching(group)[0])
+            
+            #if function not returned yet, that means all the groups have extra prompts in them
+            group = cls.persist(group)
+            for prompt in prompts:
+                PromptGroupItemService.create_persisted(group_id = group.group_id,prompt_id=prompt.prompt_id)
+            return cls.refresh_all(group)
+    
+    @classmethod
+    def persist(cls,model):
+        return cls._repo().persist(model)
+
